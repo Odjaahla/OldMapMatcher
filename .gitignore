@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+build/
+*.xcodeproj/xcuserdata/
+
+# Source scans and derived images are large; keep them local.
+maps/
+images/
