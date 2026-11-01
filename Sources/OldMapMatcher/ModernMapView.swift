@@ -36,9 +36,19 @@ final class OSMTileOverlay: MKTileOverlay {
     }
 }
 
-/// MKMapView that reports the coordinate under the mouse.
+/// MKMapView that reports the coordinate under the mouse and hosts the correction-drag layer.
 final class HoverMapView: MKMapView {
     var onHover: ((CLLocationCoordinate2D?) -> Void)?
+    let correction = CorrectionDragView()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        correction.frame = bounds
+        correction.autoresizingMask = [.width, .height]
+        addSubview(correction)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -56,6 +66,67 @@ final class HoverMapView: MKMapView {
         super.mouseExited(with: event)
         onHover?(nil)
     }
+
+    override func didAddSubview(_ subview: NSView) {
+        super.didAddSubview(subview)
+        // Keep the drag layer above MapKit's own subviews.
+        if subview !== correction, correction.superview === self {
+            addSubview(correction, positioned: .above, relativeTo: nil)
+        }
+    }
+}
+
+/// Transparent layer over the map that captures option-drags: from where a feature appears on
+/// the old-map overlay to where it really is. Plain mouse events fall through to the map.
+final class CorrectionDragView: NSView {
+    var isEnabled = false
+    var onCorrection: ((CGPoint, CGPoint) -> Void)?
+    private var start: CGPoint?
+    private var current: CGPoint?
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isEnabled, NSEvent.modifierFlags.contains(.option) else { return nil }
+        return super.hitTest(point)
+    }
+
+    override func resetCursorRects() {
+        if isEnabled { addCursorRect(bounds, cursor: .crosshair) }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        start = convert(event.locationInWindow, from: nil)
+        current = start
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        current = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let s = start, let e = current, hypot(e.x - s.x, e.y - s.y) > 3 { onCorrection?(s, e) }
+        start = nil; current = nil
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let s = start, let e = current else { return }
+        let path = NSBezierPath()
+        path.move(to: s); path.line(to: e)
+        // Arrow head.
+        let angle = atan2(e.y - s.y, e.x - s.x)
+        for da in [-0.45, 0.45] {
+            path.move(to: e)
+            path.line(to: CGPoint(x: e.x - 12 * cos(angle + da), y: e.y - 12 * sin(angle + da)))
+        }
+        path.appendOval(in: CGRect(x: s.x - 5, y: s.y - 5, width: 10, height: 10))
+        path.lineCapStyle = .round
+        NSColor.white.withAlphaComponent(0.9).setStroke(); path.lineWidth = 5; path.stroke()
+        NSColor.systemOrange.setStroke(); path.lineWidth = 2.5; path.stroke()
+    }
 }
 
 struct ModernMapView: NSViewRepresentable {
@@ -71,16 +142,20 @@ struct ModernMapView: NSViewRepresentable {
         let pending = PendingAnnotation()
         let predicted = PredictedAnnotation()
         let cursor = CursorAnnotation()
-        var warped: WarpedImageOverlay?
-        var warpedRenderer: WarpedImageRenderer?
+        var warped: [WarpedImageOverlay] = []
+        var renderers: [ObjectIdentifier: WarpedImageRenderer] = [:]
+        var opacities: [ObjectIdentifier: Double] = [:]
         var residualKey: [Double] = []
         var lastFocus: UUID?
         var cancellable: AnyCancellable?
+        var keyMonitor: Any?
 
         init(state: AppState) { self.state = state }
 
+        deinit { if let keyMonitor { NSEvent.removeMonitor(keyMonitor) } }
+
         @MainActor @objc func clicked(_ g: NSClickGestureRecognizer) {
-            guard let map = mapView else { return }
+            guard let map = mapView, state.mode == .match else { return }
             let v = g.location(in: map)
             // Clicks on markers select/drag them rather than adding points.
             var hit = map.hitTest(v)
@@ -89,6 +164,25 @@ struct ModernMapView: NSViewRepresentable {
                 hit = h.superview
             }
             state.placeOnMap(LatLon(map.convert(v, toCoordinateFrom: map)))
+        }
+
+        /// Hold space to hide all overlays (blink comparison). Ignored while typing.
+        @MainActor func installKeyMonitor() {
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+                guard let self, event.keyCode == 49, event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
+                      !(event.window?.firstResponder is NSText) else { return event }
+                if event.type == .keyDown {
+                    if !event.isARepeat { self.state.peeking = true }
+                } else {
+                    self.state.peeking = false
+                }
+                return nil
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            let region = mapView.region
+            Task { @MainActor in self.state.mapRegion = region }
         }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
@@ -168,8 +262,8 @@ struct ModernMapView: NSViewRepresentable {
                 return MKTileOverlayRenderer(tileOverlay: t)
             case let w as WarpedImageOverlay:
                 let r = WarpedImageRenderer(overlay: w)
-                r.alpha = CGFloat(state.overlayOpacity)
-                warpedRenderer = r
+                r.alpha = CGFloat(opacities[ObjectIdentifier(w)] ?? 0.7)
+                renderers[ObjectIdentifier(w)] = r
                 return r
             case let l as ResidualLine:
                 let r = MKPolylineRenderer(polyline: l)
@@ -185,19 +279,28 @@ struct ModernMapView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
     func makeNSView(context: Context) -> HoverMapView {
-        let map = HoverMapView()
-        map.delegate = context.coordinator
+        let map = HoverMapView(frame: .zero)
+        let c = context.coordinator
+        map.delegate = c
         map.showsCompass = true
         map.showsScale = true
         map.showsZoomControls = true
-        map.setRegion(MKCoordinateRegion(center: Self.home, latitudinalMeters: 4000, longitudinalMeters: 4000), animated: false)
-        let click = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.clicked(_:)))
+        map.setRegion(state.mapRegion ?? MKCoordinateRegion(center: Self.home, latitudinalMeters: 4000, longitudinalMeters: 4000),
+                      animated: false)
+        let click = NSClickGestureRecognizer(target: c, action: #selector(Coordinator.clicked(_:)))
         click.delaysPrimaryMouseButtonEvents = false
         map.addGestureRecognizer(click)
-        map.onHover = { [weak state] c in state?.hoverMap(c.map(LatLon.init)) }
-        context.coordinator.mapView = map
-        let cursor = context.coordinator.cursor
-        context.coordinator.cancellable = state.cursor.geo
+        map.onHover = { [weak state] p in state?.hoverMap(p.map(LatLon.init)) }
+        map.correction.onCorrection = { [weak state, weak map] s, e in
+            guard let state, let map else { return }
+            let from = LatLon(map.convert(s, toCoordinateFrom: map.correction))
+            let to = LatLon(map.convert(e, toCoordinateFrom: map.correction))
+            if !state.addCorrection(from: from, to: to) { NSSound.beep() }
+        }
+        c.mapView = map
+        c.installKeyMonitor()
+        let cursor = c.cursor
+        c.cancellable = state.cursor.geo
             .receive(on: RunLoop.main)
             .sink { [weak map] g in
                 guard let map else { return }
@@ -214,12 +317,17 @@ struct ModernMapView: NSViewRepresentable {
     func updateNSView(_ map: HoverMapView, context: Context) {
         let c = context.coordinator
         c.state = state
+        let correctionEnabled = state.mode == .explore && state.geoRef != nil
+        if map.correction.isEnabled != correctionEnabled {
+            map.correction.isEnabled = correctionEnabled
+            map.window?.invalidateCursorRects(for: map.correction)
+        }
         applyBaseLayer(map, c)
         syncControlPoints(map, c)
         syncSingle(map, c.pending, at: state.pendingGeo)
         syncSingle(map, c.predicted, at: state.predictedGeo)
         syncResiduals(map, c)
-        syncWarpedOverlay(map, c)
+        syncWarpedOverlays(map, c)
         if let f = state.geoFocus, f.token != c.lastFocus {
             c.lastFocus = f.token
             map.setCenter(f.value.coordinate, animated: true)
@@ -242,8 +350,9 @@ struct ModernMapView: NSViewRepresentable {
     }
 
     private func syncControlPoints(_ map: MKMapView, _ c: Coordinator) {
+        let points = state.showMarkers || state.mode == .match ? state.points : []
         var seen = Set<UUID>()
-        for (i, p) in state.points.enumerated() {
+        for (i, p) in points.enumerated() {
             seen.insert(p.id)
             let a = c.annotations[p.id] ?? {
                 let a = ControlPointAnnotation(id: p.id)
@@ -298,21 +407,27 @@ struct ModernMapView: NSViewRepresentable {
         map.addOverlays(lines, level: .aboveLabels)
     }
 
-    private func syncWarpedOverlay(_ map: MKMapView, _ c: Coordinator) {
-        let wanted = state.showOverlay ? state.overlay : nil
-        if wanted !== c.warped {
-            if let old = c.warped { map.removeOverlay(old) }
-            c.warped = wanted
-            c.warpedRenderer = nil
-            if let w = wanted {
-                // Above the base map, below the residual arrows.
-                let index = c.tileOverlay == nil ? 0 : 1
-                map.insertOverlay(w, at: index, level: .aboveLabels)
+    private func syncWarpedOverlays(_ map: MKMapView, _ c: Coordinator) {
+        let wanted = state.displayedOverlays
+        for (o, opacity) in wanted { c.opacities[ObjectIdentifier(o)] = state.peeking ? 0 : opacity }
+
+        if wanted.map({ ObjectIdentifier($0.overlay) }) != c.warped.map(ObjectIdentifier.init) {
+            map.removeOverlays(c.warped)
+            for o in c.warped where !wanted.contains(where: { $0.overlay === o }) {
+                c.renderers[ObjectIdentifier(o)] = nil
+                c.opacities[ObjectIdentifier(o)] = nil
             }
+            // Bottom to top, above the base map and below the residual arrows.
+            let base = c.tileOverlay == nil ? 0 : 1
+            for (i, (o, _)) in wanted.enumerated() { map.insertOverlay(o, at: base + i, level: .aboveLabels) }
+            c.warped = wanted.map(\.overlay)
         }
-        if let r = c.warpedRenderer, abs(r.alpha - CGFloat(state.overlayOpacity)) > 0.001 {
-            r.alpha = CGFloat(state.overlayOpacity)
-            r.setNeedsDisplay()
+        for o in c.warped {
+            let id = ObjectIdentifier(o)
+            if let r = c.renderers[id], let a = c.opacities[id], abs(r.alpha - CGFloat(a)) > 0.001 {
+                r.alpha = CGFloat(a)
+                r.setNeedsDisplay()
+            }
         }
     }
 }

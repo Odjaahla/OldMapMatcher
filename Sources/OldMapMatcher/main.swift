@@ -17,6 +17,12 @@ struct OldMapMatcherApp: App {
                 Button("Rescan Images") { state.rescan() }
                     .keyboardShortcut("r")
             }
+            CommandMenu("Mode") {
+                Button("Match Points") { state.mode = .match }
+                    .keyboardShortcut("1")
+                Button("Explore Layers") { state.mode = .explore }
+                    .keyboardShortcut("2")
+            }
         }
     }
 }

@@ -10,11 +10,15 @@ struct SourceRaster: @unchecked Sendable {
     /// Original image pixels per raster pixel.
     let factor: Double
 
-    init(_ image: CGImage, maxDimension: Int) {
-        let f = max(1, Double(max(image.width, image.height)) / Double(maxDimension))
+    static let maxDimension = 4096
+
+    /// `image` may be a downsampled thumbnail; `originalWidth` is the full image's width in pixels,
+    /// which is the coordinate system control points use.
+    init(_ image: CGImage, originalWidth: Int) {
+        let f = max(1, Double(max(image.width, image.height)) / Double(SourceRaster.maxDimension))
         width = Int((Double(image.width) / f).rounded())
         height = Int((Double(image.height) / f).rounded())
-        factor = f
+        factor = Double(originalWidth) / Double(width)
         var buf = [UInt8](repeating: 0, count: width * height * 4)
         let (w, h) = (width, height)
         buf.withUnsafeMutableBytes { ptr in

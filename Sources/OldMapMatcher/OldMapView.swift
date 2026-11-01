@@ -267,7 +267,7 @@ struct OldMapView: NSViewRepresentable {
     }
 
     func updateNSView(_ canvas: OldMapCanvas, context: Context) {
-        canvas.image = state.image
+        canvas.image = state.active?.image
         canvas.markers = state.points.enumerated().map { i, p in
             CanvasMarker(id: p.id, number: i + 1, position: p.image, selected: state.selection.contains(p.id), enabled: p.enabled)
         }

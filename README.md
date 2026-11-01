@@ -32,6 +32,18 @@ On first launch choose this folder as the project folder (File → Open Project 
   feature; untick *Use* to exclude a point without deleting it.
 - **Overlay** draws the warped old map over the modern map.
 
+### Explore mode (⌘2)
+
+Switch between **Match** (⌘1) and **Explore** (⌘2) at any time; the modern map keeps its position.
+
+- Every map with at least 2 points can be shown as a layer: tick it in the sidebar and set its
+  opacity. Drag rows to reorder them (the top row is drawn on top).
+- **Option-drag** from a feature on the selected map's layer to where that feature is today. This adds
+  a control point, and the fit and overlay update straight away. Use it for roads, buildings and
+  boundaries that the overlay shows have survived.
+- **Hold Space** to hide all layers so you can compare with the modern map (release to bring them back).
+- The points table and statistics stay visible, so you can see whether each new point improved the fit.
+
 Control points are saved automatically to `gcps/<image>.json`. These files are the valuable output,
 so commit them.
 

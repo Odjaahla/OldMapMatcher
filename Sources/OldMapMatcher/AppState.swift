@@ -1,14 +1,8 @@
 import AppKit
 import Combine
-import ImageIO
+import MapKit
 import MapMatchCore
 import SwiftUI
-
-struct MapEntry: Identifiable, Hashable {
-    let url: URL
-    var id: URL { url }
-    var name: String { url.deletingPathExtension().lastPathComponent }
-}
 
 enum BaseLayer: String, CaseIterable, Identifiable {
     case appleStandard, appleSatellite, openStreetMap
@@ -22,18 +16,25 @@ enum BaseLayer: String, CaseIterable, Identifiable {
     }
 }
 
+enum Mode: String, CaseIterable, Identifiable {
+    /// Old map beside the modern map; click pairs of features.
+    case match
+    /// Modern map with georeferenced old maps stacked as layers; option-drag to correct.
+    case explore
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .match: "Match"
+        case .explore: "Explore"
+        }
+    }
+}
+
 /// A request for a view to centre on something. The token makes repeated requests for the
 /// same location distinct, so views can tell "already handled" from "new request".
 struct FocusRequest<Value: Equatable>: Equatable {
     let value: Value
     let token = UUID()
-}
-
-/// On-disk control points for one map: `gcps/<image file name>.json`.
-struct ControlPointFile: Codable {
-    var image: String
-    var kind: TransformKind
-    var points: [ControlPoint]
 }
 
 /// Mouse position mirrored between the two views. Kept outside `AppState`'s published
@@ -45,50 +46,71 @@ final class LinkedCursor {
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published private(set) var workspace: URL?
-    @Published private(set) var maps: [MapEntry] = []
-    @Published var selectedMap: MapEntry? { didSet { if oldValue != selectedMap { loadSelectedMap() } } }
-    @Published private(set) var image: CGImage?
-    @Published private(set) var loadError: String?
+    private let defaults = UserDefaults.standard
 
-    @Published var points: [ControlPoint] = [] { didSet { if oldValue != points { pointsChanged() } } }
-    @Published var kind: TransformKind = .affine { didSet { if oldValue != kind { pointsChanged() } } }
-    @Published private(set) var geoRef: GeoReference?
+    @Published private(set) var workspace: URL?
+    /// All maps in layer order: first = top layer.
+    @Published private(set) var documents: [MapDocument] = []
+    /// The map whose points are being edited.
+    @Published private(set) var active: MapDocument?
+
+    @Published var mode = Mode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .match {
+        didSet {
+            guard mode != oldValue else { return }
+            defaults.set(mode.rawValue, forKey: "mode")
+            cancelPending()
+            cursor.geo.send(nil); cursor.image.send(nil)
+            updateDocumentNeeds()
+        }
+    }
 
     @Published private(set) var pendingImage: Vec2?
     @Published private(set) var pendingGeo: LatLon?
     @Published var selection: Set<ControlPoint.ID> = []
 
     @Published var baseLayer = BaseLayer(rawValue: UserDefaults.standard.string(forKey: "baseLayer") ?? "") ?? .appleStandard {
-        didSet { UserDefaults.standard.set(baseLayer.rawValue, forKey: "baseLayer") }
+        didSet { defaults.set(baseLayer.rawValue, forKey: "baseLayer") }
     }
     @Published var showResiduals = UserDefaults.standard.object(forKey: "showResiduals") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showResiduals, forKey: "showResiduals") }
+        didSet { defaults.set(showResiduals, forKey: "showResiduals") }
     }
+    @Published var showMarkers = UserDefaults.standard.object(forKey: "showMarkers") as? Bool ?? true {
+        didSet { defaults.set(showMarkers, forKey: "showMarkers") }
+    }
+    /// Match mode: show the active map's overlay on the modern map.
     @Published var showOverlay = UserDefaults.standard.bool(forKey: "showOverlay") {
         didSet {
-            UserDefaults.standard.set(showOverlay, forKey: "showOverlay")
-            if showOverlay != oldValue { rebuildOverlay() }
+            defaults.set(showOverlay, forKey: "showOverlay")
+            updateDocumentNeeds()
         }
     }
+    /// Match mode overlay opacity (explore mode uses each layer's own opacity).
     @Published var overlayOpacity = UserDefaults.standard.object(forKey: "overlayOpacity") as? Double ?? 0.6 {
-        didSet { UserDefaults.standard.set(overlayOpacity, forKey: "overlayOpacity") }
+        didSet { defaults.set(overlayOpacity, forKey: "overlayOpacity") }
     }
-    @Published private(set) var overlay: WarpedImageOverlay?
-    @Published private(set) var overlayBusy = false
+    /// True while space is held: all overlays hidden to compare with the modern map.
+    @Published var peeking = false
 
     @Published var imageFocus: FocusRequest<Vec2>?
     @Published var geoFocus: FocusRequest<LatLon>?
 
     let cursor = LinkedCursor()
+    /// Last visible region of the modern map, so it survives mode switches and relaunches.
+    var mapRegion: MKCoordinateRegion? {
+        didSet {
+            guard let r = mapRegion else { return }
+            defaults.set([r.center.latitude, r.center.longitude, r.span.latitudeDelta, r.span.longitudeDelta], forKey: "mapRegion")
+        }
+    }
 
-    private var raster: SourceRaster?
-    private var overlayTask: Task<Void, Never>?
-    private var loadTask: Task<Void, Never>?
+    private var documentObservers: [AnyCancellable] = []
 
     init() {
-        if let path = UserDefaults.standard.string(forKey: "workspace"),
-           FileManager.default.fileExists(atPath: path) {
+        if let r = defaults.array(forKey: "mapRegion") as? [Double], r.count == 4 {
+            mapRegion = MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: r[0], longitude: r[1]),
+                                           span: MKCoordinateSpan(latitudeDelta: r[2], longitudeDelta: r[3]))
+        }
+        if let path = defaults.string(forKey: "workspace"), FileManager.default.fileExists(atPath: path) {
             setWorkspace(URL(fileURLWithPath: path))
         } else {
             let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -110,117 +132,103 @@ final class AppState: ObservableObject {
 
     func setWorkspace(_ url: URL) {
         workspace = url
-        UserDefaults.standard.set(url.path, forKey: "workspace")
+        defaults.set(url.path, forKey: "workspace")
         rescan()
     }
+
+    private var layerKey: String { "layers:" + (workspace?.path ?? "") }
 
     func rescan() {
         guard let workspace else { return }
         let dir = workspace.appendingPathComponent("images").resolvingSymlinksInPath()
-        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-        maps = files
+        let gcpDir = workspace.appendingPathComponent("gcps")
+        let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
             .filter { ["jpg", "jpeg", "png", "tif", "tiff"].contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            .map(MapEntry.init)
-        if selectedMap == nil || !maps.contains(selectedMap!) {
-            let last = UserDefaults.standard.string(forKey: "lastMap")
-            selectedMap = maps.first { $0.url.lastPathComponent == last } ?? maps.first
+
+        let existing = Dictionary(uniqueKeysWithValues: documents.map { ($0.url, $0) })
+        var docs = files.map { existing[$0] ?? MapDocument(url: $0, gcpDirectory: gcpDir) }
+
+        // Restore saved layer order and settings.
+        let saved = defaults.dictionary(forKey: layerKey) ?? [:]
+        let order = saved["order"] as? [String] ?? []
+        docs.sort { a, b in
+            let ia = order.firstIndex(of: a.url.lastPathComponent) ?? Int.max
+            let ib = order.firstIndex(of: b.url.lastPathComponent) ?? Int.max
+            return ia != ib ? ia < ib : a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
         }
+        let settings = saved["settings"] as? [String: [String: Any]] ?? [:]
+        for d in docs where existing[d.url] == nil {
+            if let s = settings[d.url.lastPathComponent] {
+                d.visible = s["visible"] as? Bool ?? false
+                d.opacity = s["opacity"] as? Double ?? 0.7
+            }
+        }
+        documents = docs
+
+        documentObservers = docs.map { d in
+            d.onLayerChange = { [weak self] in self?.layersChanged() }
+            // Forward document changes so views observing AppState refresh.
+            return d.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        }
+
+        if active == nil || !docs.contains(where: { $0 === active }) {
+            let last = defaults.string(forKey: "lastMap")
+            activate(docs.first { $0.url.lastPathComponent == last } ?? docs.first)
+        }
+        updateDocumentNeeds()
     }
 
-    private var gcpURL: URL? {
-        guard let workspace, let selectedMap else { return nil }
-        return workspace.appendingPathComponent("gcps")
-            .appendingPathComponent(selectedMap.url.lastPathComponent + ".json")
+    private func layersChanged() {
+        saveLayerSettings()
+        updateDocumentNeeds()
     }
 
-    private func loadSelectedMap() {
-        loadTask?.cancel()
-        overlayTask?.cancel()
-        image = nil; raster = nil; overlay = nil; loadError = nil
+    private func saveLayerSettings() {
+        var settings: [String: [String: Any]] = [:]
+        for d in documents { settings[d.url.lastPathComponent] = ["visible": d.visible, "opacity": d.opacity] }
+        defaults.set(["order": documents.map(\.url.lastPathComponent), "settings": settings], forKey: layerKey)
+    }
+
+    func moveLayers(from source: IndexSet, to destination: Int) {
+        documents.move(fromOffsets: source, toOffset: destination)
+        saveLayerSettings()
+    }
+
+    func activate(_ doc: MapDocument?) {
+        guard doc !== active else { return }
+        active = doc
         pendingImage = nil; pendingGeo = nil; selection = []
         cursor.geo.send(nil); cursor.image.send(nil)
-        guard let map = selectedMap else { points = []; return }
-        UserDefaults.standard.set(map.url.lastPathComponent, forKey: "lastMap")
+        if let doc { defaults.set(doc.url.lastPathComponent, forKey: "lastMap") }
+        updateDocumentNeeds()
+    }
 
-        isLoading = true
-        if let url = gcpURL, FileManager.default.fileExists(atPath: url.path) {
-            do {
-                let file = try JSONDecoder().decode(ControlPointFile.self, from: Data(contentsOf: url))
-                kind = file.kind
-                points = file.points
-            } catch {
-                points = []
-                loadError = "Could not read \(url.lastPathComponent): \(error.localizedDescription). It will not be overwritten until you add a point."
-            }
-        } else {
-            points = []
-        }
-        isLoading = false
-        pointsChanged(save: false)
-
-        loadTask = Task {
-            let decoded = await Task.detached(priority: .userInitiated) { () -> (CGImage, SourceRaster)? in
-                guard let src = CGImageSourceCreateWithURL(map.url as CFURL, nil),
-                      let img = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
-                else { return nil }
-                return (img, SourceRaster(img, maxDimension: 4096))
-            }.value
-            guard !Task.isCancelled, selectedMap == map else { return }
-            if let (img, r) = decoded {
-                image = img; raster = r
-                rebuildOverlay()
-            } else {
-                loadError = "Could not read \(map.url.lastPathComponent)"
-            }
+    /// Decides which documents need their full image and which need overlays.
+    private func updateDocumentNeeds() {
+        for d in documents {
+            d.wantsFullImage = d === active && mode == .match
+            d.wantsOverlay = mode == .explore ? d.visible : (d === active && showOverlay)
         }
     }
 
-    private var isLoading = false
-
-    private func save() {
-        guard let url = gcpURL, let selectedMap else { return }
-        let file = ControlPointFile(image: selectedMap.url.lastPathComponent, kind: kind, points: points)
-        do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try enc.encode(file).write(to: url, options: .atomic)
-        } catch {
-            NSLog("Failed to save control points: \(error)")
+    /// Overlays to draw, bottom to top, with their opacity.
+    var displayedOverlays: [(overlay: WarpedImageOverlay, opacity: Double)] {
+        switch mode {
+        case .match:
+            guard showOverlay, let o = active?.overlay else { return [] }
+            return [(o, overlayOpacity)]
+        case .explore:
+            return documents.reversed().compactMap { d in d.visible ? d.overlay.map { ($0, d.opacity) } : nil }
         }
     }
 
-    // MARK: Fitting
+    var overlayBusy: Bool { documents.contains { $0.wantsOverlay && $0.overlayBusy } }
 
-    /// Left-out error (RMS, metres) for each model on the current points; nil = too few points.
-    @Published private(set) var modelComparison: [TransformKind: Double] = [:]
+    // MARK: Editing the active map
 
-    /// The model that best predicts points it wasn't fitted to.
-    var bestModel: TransformKind? { modelComparison.min { $0.value < $1.value }?.key }
-
-    /// Flagging single points as outliers is only meaningful once there's redundancy to compare against.
-    var enoughPointsToFlagOutliers: Bool { points.filter(\.enabled).count >= 6 }
-
-    private func pointsChanged(save shouldSave: Bool = true) {
-        guard !isLoading else { return }
-        geoRef = GeoReference(points: points, kind: kind)
-            ?? (kind != .similarity ? GeoReference(points: points, kind: .similarity) : nil)
-        var comparison: [TransformKind: Double] = [:]
-        for k in TransformKind.allCases {
-            if k == geoRef?.kind, let v = geoRef?.rmsLeaveOneOut {
-                comparison[k] = v
-            } else if let v = GeoReference(points: points, kind: k)?.rmsLeaveOneOut {
-                comparison[k] = v
-            }
-        }
-        modelComparison = comparison
-        if shouldSave { save() }
-        rebuildOverlay()
-    }
-
-    /// Kind actually in use (falls back to similarity while there are too few points).
-    var effectiveKind: TransformKind? { geoRef?.kind }
+    var points: [ControlPoint] { active?.points ?? [] }
+    var geoRef: GeoReference? { active?.geoRef }
 
     var predictedGeo: LatLon? {
         guard let p = pendingImage, pendingGeo == nil else { return nil }
@@ -232,14 +240,13 @@ final class AppState: ObservableObject {
         return geoRef?.geoToImage(g)
     }
 
-    // MARK: Editing
-
     func placeOnImage(_ p: Vec2) {
         pendingImage = p
         if pendingGeo != nil { commitPending() } else if let g = predictedGeo { geoFocus = FocusRequest(value: g) }
     }
 
     func placeOnMap(_ g: LatLon) {
+        guard mode == .match else { return }
         pendingGeo = g
         if pendingImage != nil { commitPending() } else if let p = predictedImage { imageFocus = FocusRequest(value: p) }
     }
@@ -252,73 +259,58 @@ final class AppState: ObservableObject {
 
     private func commitPending() {
         guard let p = pendingImage, let g = pendingGeo else { return }
-        let point = ControlPoint(image: p, geo: g)
         pendingImage = nil; pendingGeo = nil
-        points.append(point)
+        addPoint(ControlPoint(image: p, geo: g))
+    }
+
+    private func addPoint(_ point: ControlPoint) {
+        active?.points.append(point)
         selection = [point.id]
     }
 
     func cancelPending() { pendingImage = nil; pendingGeo = nil }
 
+    /// Explore mode: the feature drawn at `from` on the active map's overlay really lies at `to`.
+    /// Returns false if `from` isn't on the old map.
+    @discardableResult
+    func addCorrection(from: LatLon, to: LatLon) -> Bool {
+        guard let doc = active, let g = doc.geoRef, let size = doc.imageSize else { return false }
+        let p = g.geoToImage(from)
+        guard p.x >= 0, p.y >= 0, p.x < size.x, p.y < size.y else { return false }
+        addPoint(ControlPoint(image: p, geo: to))
+        return true
+    }
+
     func moveImage(of id: UUID, to p: Vec2) {
-        if let i = points.firstIndex(where: { $0.id == id }) { points[i].image = p }
+        guard let doc = active, let i = doc.points.firstIndex(where: { $0.id == id }) else { return }
+        doc.points[i].image = p
     }
 
     func moveGeo(of id: UUID, to g: LatLon) {
-        if let i = points.firstIndex(where: { $0.id == id }) { points[i].geo = g }
+        guard let doc = active, let i = doc.points.firstIndex(where: { $0.id == id }) else { return }
+        doc.points[i].geo = g
     }
 
-    func select(_ id: UUID) {
-        selection = [id]
-    }
+    func select(_ id: UUID) { selection = [id] }
 
     func focus(on id: UUID) {
         guard let p = points.first(where: { $0.id == id }) else { return }
-        imageFocus = FocusRequest(value: p.image)
+        if mode == .match { imageFocus = FocusRequest(value: p.image) }
         geoFocus = FocusRequest(value: p.geo)
     }
 
     func deleteSelected() {
-        points.removeAll { selection.contains($0.id) }
+        active?.points.removeAll { selection.contains($0.id) }
         selection = []
-    }
-
-    func toggleEnabledSelected() {
-        for i in points.indices where selection.contains(points[i].id) { points[i].enabled.toggle() }
     }
 
     func number(of id: UUID) -> Int? { points.firstIndex { $0.id == id }.map { $0 + 1 } }
 
     // MARK: Linked cursor
 
-    func hoverImage(_ p: Vec2?) {
-        cursor.geo.send(p.flatMap { geoRef?.imageToGeo($0) })
-    }
-
+    func hoverImage(_ p: Vec2?) { cursor.geo.send(p.flatMap { geoRef?.imageToGeo($0) }) }
     func hoverMap(_ g: LatLon?) {
+        guard mode == .match else { return }
         cursor.image.send(g.flatMap { geoRef?.geoToImage($0) })
-    }
-
-    // MARK: Overlay
-
-    private func rebuildOverlay() {
-        overlayTask?.cancel()
-        guard showOverlay, let geoRef, let raster, let image else {
-            if !showOverlay { overlay = nil }
-            overlayBusy = false
-            return
-        }
-        overlayBusy = true
-        let size = Vec2(Double(image.width), Double(image.height))
-        overlayTask = Task {
-            try? await Task.sleep(for: .milliseconds(150)) // coalesce bursts of edits
-            guard !Task.isCancelled else { return }
-            let result = await Task.detached(priority: .userInitiated) {
-                Warper.warp(raster, imageSize: size, geoRef: geoRef)
-            }.value
-            guard !Task.isCancelled else { return }
-            overlay = result
-            overlayBusy = false
-        }
     }
 }
