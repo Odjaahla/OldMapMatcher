@@ -299,6 +299,13 @@ struct ModernMapView: NSViewRepresentable {
         }
         c.mapView = map
         c.installKeyMonitor()
+        state.modernMapMetrics = { [weak map] in
+            guard let map, map.bounds.width > 0 else { return nil }
+            let y = map.bounds.midY
+            let a = MKMapPoint(map.convert(CGPoint(x: 0, y: y), toCoordinateFrom: map))
+            let b = MKMapPoint(map.convert(CGPoint(x: map.bounds.width, y: y), toCoordinateFrom: map))
+            return (LatLon(map.centerCoordinate), a.distance(to: b) / map.bounds.width)
+        }
         let cursor = c.cursor
         c.cancellable = state.cursor.geo
             .receive(on: RunLoop.main)

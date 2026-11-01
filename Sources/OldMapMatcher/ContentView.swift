@@ -131,6 +131,10 @@ struct ControlBar: View {
                     .frame(width: 110)
                     .disabled(!state.showOverlay)
                     .help("Overlay opacity")
+                Button { state.syncImageToMap() } label: { Label("Align views", systemImage: "viewfinder") }
+                    .disabled(state.geoRef == nil)
+                    .keyboardShortcut("l", modifiers: .command)
+                    .help("Show the old map at the same place and scale as the modern map (⌘L)")
             case .explore:
                 Toggle("Points", isOn: $state.showMarkers)
                     .help("Show the active map's control points")

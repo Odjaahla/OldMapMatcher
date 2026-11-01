@@ -61,6 +61,7 @@ final class AppState: ObservableObject {
             cancelPending()
             cursor.geo.send(nil); cursor.image.send(nil)
             updateDocumentNeeds()
+            if mode == .match { syncImageToMapSoon() }
         }
     }
 
@@ -92,6 +93,9 @@ final class AppState: ObservableObject {
     @Published var peeking = false
 
     @Published var imageFocus: FocusRequest<Vec2>?
+    @Published var imageViewport: FocusRequest<ImageViewport>?
+    /// Reads the modern map's current centre and ground scale (metres per view point). Set by the map view.
+    var modernMapMetrics: (() -> (center: LatLon, metresPerPoint: Double)?)?
     @Published var geoFocus: FocusRequest<LatLon>?
 
     let cursor = LinkedCursor()
@@ -118,6 +122,7 @@ final class AppState: ObservableObject {
                 setWorkspace(cwd)
             }
         }
+        if mode == .match { syncImageToMapSoon() }
     }
 
     // MARK: Workspace
@@ -202,6 +207,23 @@ final class AppState: ObservableObject {
         cursor.geo.send(nil); cursor.image.send(nil)
         if let doc { defaults.set(doc.url.lastPathComponent, forKey: "lastMap") }
         updateDocumentNeeds()
+        if mode == .match { syncImageToMap() }
+    }
+
+    /// Shows the old map at the same place and ground scale as the modern map.
+    func syncImageToMap() {
+        guard let g = geoRef, let m = modernMapMetrics?(), m.metresPerPoint > 0 else { return }
+        let center = g.geoToImage(m.center)
+        imageViewport = FocusRequest(value: ImageViewport(center: center, scale: g.metresPerPixel(at: center) / m.metresPerPoint))
+    }
+
+    /// After a mode switch the modern map is resized; read its metrics once the layout has settled.
+    private func syncImageToMapSoon() {
+        Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard mode == .match else { return }
+            syncImageToMap()
+        }
     }
 
     /// Decides which documents need their full image and which need overlays.

@@ -3,6 +3,13 @@ import Combine
 import MapMatchCore
 import SwiftUI
 
+/// What the old-map canvas should show: an image point at the view centre, at a given zoom.
+struct ImageViewport: Equatable {
+    var center: Vec2
+    /// View points per image pixel.
+    var scale: Double
+}
+
 struct CanvasMarker: Equatable {
     let id: UUID
     let number: Int
@@ -38,6 +45,9 @@ final class OldMapCanvas: NSView {
     /// View location of image pixel (0, 0).
     private var offset = CGPoint.zero
     private var needsInitialFit = true
+    /// Viewport to apply once the image and view size are known (instead of fitting the whole image).
+    private var pendingViewport: ImageViewport?
+    private var lastBoundsSize = CGSize.zero
 
     private let imageLayer = CALayer()
     private lazy var overlay = MarkerOverlay(canvas: self)
@@ -69,14 +79,46 @@ final class OldMapCanvas: NSView {
     func viewPoint(_ p: Vec2) -> CGPoint { CGPoint(x: offset.x + CGFloat(p.x) * scale, y: offset.y + CGFloat(p.y) * scale) }
     func imagePoint(_ v: CGPoint) -> Vec2 { Vec2(Double((v.x - offset.x) / scale), Double((v.y - offset.y) / scale)) }
 
+    private var fitScale: CGFloat {
+        guard let image else { return 1 }
+        return min(bounds.width / CGFloat(image.width), bounds.height / CGFloat(image.height))
+    }
+
     override func layout() {
         super.layout()
-        if needsInitialFit, let image, bounds.width > 0 {
+        if needsInitialFit, let image, bounds.width > 0, bounds.height > 0 {
             needsInitialFit = false
-            scale = min(bounds.width / CGFloat(image.width), bounds.height / CGFloat(image.height)) * 0.95
-            offset = CGPoint(x: (bounds.width - CGFloat(image.width) * scale) / 2,
-                             y: (bounds.height - CGFloat(image.height) * scale) / 2)
+            if let v = pendingViewport {
+                pendingViewport = nil
+                apply(v)
+            } else {
+                scale = fitScale * 0.95
+                offset = CGPoint(x: (bounds.width - CGFloat(image.width) * scale) / 2,
+                                 y: (bounds.height - CGFloat(image.height) * scale) / 2)
+            }
+        } else if lastBoundsSize != .zero, lastBoundsSize != bounds.size {
+            // Keep whatever was in the middle of the view in the middle while resizing.
+            offset.x += (bounds.width - lastBoundsSize.width) / 2
+            offset.y += (bounds.height - lastBoundsSize.height) / 2
         }
+        lastBoundsSize = bounds.size
+        applyTransform()
+    }
+
+    /// Shows `v` now if possible, otherwise as soon as the image and view size are known.
+    func show(_ v: ImageViewport) {
+        if image != nil, bounds.width > 0, bounds.height > 0, !needsInitialFit {
+            apply(v)
+        } else {
+            pendingViewport = v
+            needsInitialFit = true
+            needsLayout = true
+        }
+    }
+
+    private func apply(_ v: ImageViewport) {
+        scale = min(max(CGFloat(v.scale), fitScale * 0.3), 8)
+        offset = CGPoint(x: bounds.midX - CGFloat(v.center.x) * scale, y: bounds.midY - CGFloat(v.center.y) * scale)
         applyTransform()
     }
 
@@ -90,9 +132,8 @@ final class OldMapCanvas: NSView {
     }
 
     private func zoom(by factor: CGFloat, around v: CGPoint) {
-        guard let image else { return }
-        let fit = min(bounds.width / CGFloat(image.width), bounds.height / CGFloat(image.height))
-        let newScale = min(max(scale * factor, fit * 0.3), 8)
+        guard image != nil else { return }
+        let newScale = min(max(scale * factor, fitScale * 0.3), 8)
         let anchor = imagePoint(v)
         scale = newScale
         offset = CGPoint(x: v.x - CGFloat(anchor.x) * scale, y: v.y - CGFloat(anchor.y) * scale)
@@ -249,6 +290,7 @@ struct OldMapView: NSViewRepresentable {
 
     final class Coordinator {
         var lastFocus: UUID?
+        var lastViewport: UUID?
         var cancellable: AnyCancellable?
     }
 
@@ -273,6 +315,10 @@ struct OldMapView: NSViewRepresentable {
         }
         canvas.pending = state.pendingImage
         canvas.predicted = state.predictedImage
+        if let v = state.imageViewport, v.token != context.coordinator.lastViewport {
+            context.coordinator.lastViewport = v.token
+            canvas.show(v.value)
+        }
         if let f = state.imageFocus, f.token != context.coordinator.lastFocus {
             context.coordinator.lastFocus = f.token
             canvas.center(on: f.value)
