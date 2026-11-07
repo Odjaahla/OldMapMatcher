@@ -80,22 +80,118 @@ import Testing
     @Test func tpsInterpolatesExactlyWithoutSmoothing() throws {
         var (src, dst) = syntheticPairs()
         dst = dst.enumerated().map { i, p in p + Vec2(sin(Double(i)) * 20, cos(Double(i) * 0.7) * 20) }
-        let t = try #require(TransformFitter.fit(.thinPlateSpline, src: src, dst: dst, lambda: 0))
+        let t = try #require(TransformFitter.fit(.thinPlateSpline, src: src, dst: dst, parameters: .thinPlate(lambda: 0)))
         for (s, d) in zip(src, dst) { #expect((t.apply(s) - d).length < 1e-4) }
     }
 
     @Test func automaticSmoothingPrefersStiffModelForPureNoise() {
         let (src, dst) = syntheticPairs(noise: 5)
-        let lambda = TransformFitter.bestSmoothing(src: src, dst: dst)
+        guard case .thinPlate(let lambda) = TransformFitter.bestParameters(.thinPlateSpline, src: src, dst: dst) else {
+            Issue.record("expected thin-plate parameters"); return
+        }
         #expect(lambda >= 0.1)
     }
 
     @Test func leaveOneOutReflectsNoiseLevel() {
         let (src, dst) = syntheticPairs(noise: 3)
-        let errs = TransformFitter.leaveOneOutErrors(.affine, src: src, dst: dst)
+        let errs = TransformFitter.leaveOneOutErrors(.affine, src: src, dst: dst)!
         let rms = (errs.map { $0 * $0 }.reduce(0, +) / Double(errs.count)).squareRoot()
         #expect(rms > 1 && rms < 8) // uniform ±3 m noise per axis ≈ 2.4 m radial, a bit more out-of-sample
     }
+}
+
+@Suite struct LocalCorrectionTests {
+    /// Random points (metres) mapped by an affine plus patch offsets: every point within a 1 km patch
+    /// shares the same displacement, like a map compiled from separately surveyed pieces.
+    /// About 5 points per patch, so each patch's offset can be learnt from its neighbours.
+    func patchyPairs(noise: Double, patchOffset: Double, seed: UInt64 = 1) -> ([Vec2], [Vec2]) {
+        var rng = SplitMix(seed: seed)
+        var patches: [Int: Vec2] = [:]
+        var src: [Vec2] = [], dst: [Vec2] = []
+        for _ in 0..<120 {
+            let p = Vec2(rng.uniform(0, 6000), rng.uniform(0, 4000))
+            let key = Int(p.x / 1000) * 100 + Int(p.y / 1000)
+            let off = patches[key] ?? Vec2(rng.uniform(-patchOffset, patchOffset), rng.uniform(-patchOffset, patchOffset))
+            patches[key] = off
+            let n = Vec2(rng.uniform(-noise, noise), rng.uniform(-noise, noise))
+            src.append(Vec2(p.x / 2, p.y / 2)) // "pixels" at 2 m/px
+            dst.append(Vec2(670_000 + p.x * 0.999, 6_570_000 + p.y * 1.004) + off + n)
+        }
+        return (src, dst)
+    }
+
+    func rms(_ e: [Double]) -> Double { (e.map { $0 * $0 }.reduce(0, +) / Double(e.count)).squareRoot() }
+
+    @Test(arguments: [ModelParameters.thinPlate(lambda: 0.05), .local(rangeMetres: 500, noiseRatio: 0.3)])
+    func closedFormLeaveOneOutMatchesRefitting(_ p: ModelParameters) throws {
+        let (src, dst) = patchyPairs(noise: 4, patchOffset: 20)
+        let kind: TransformKind = if case .thinPlate = p { .thinPlateSpline } else { .localCorrection }
+        let fast = try #require(TransformFitter.leaveOneOutErrors(kind, src: src, dst: dst, parameters: p, srcUnitsPerMetre: 0.5))
+        // Brute force with the same normalisation as the closed form (fixed hyperparameters in normalised units).
+        let ns = Normalizer(src), nd = Normalizer(dst)
+        let s = src.map(ns.forward), d = dst.map(nd.forward)
+        let kernel: RadialKernel, diag: Double
+        switch p {
+        case .thinPlate(let l): (kernel, diag) = (.thinPlate, l)
+        case .local(let r, let q): (kernel, diag) = (.matern32(range: r * 0.5 / ns.scale), q * q)
+        }
+        for i in s.indices {
+            var s2 = s, d2 = d
+            s2.remove(at: i); d2.remove(at: i)
+            let t = try #require(RadialBasisTransform.fit(s2, d2, kernel: kernel, diag: diag))
+            let slow = (t.apply(s[i]) - d[i]).length * nd.scale
+            #expect(abs(slow - fast[i]) < 1e-6 * max(1, slow))
+        }
+    }
+
+    @Test func beatsAffineWhenErrorsComeInPatches() throws {
+        let (src, dst) = patchyPairs(noise: 3, patchOffset: 25)
+        let affine = rms(try #require(TransformFitter.leaveOneOutErrors(.affine, src: src, dst: dst)))
+        let p = TransformFitter.bestParameters(.localCorrection, src: src, dst: dst, srcUnitsPerMetre: 0.5)
+        let local = rms(try #require(TransformFitter.leaveOneOutErrors(.localCorrection, src: src, dst: dst, parameters: p,
+                                                                        srcUnitsPerMetre: 0.5)))
+        #expect(local < affine * 0.8)
+        guard case .local(let range, _) = p else { Issue.record("expected local parameters"); return }
+        #expect(range >= 250 && range <= 2000) // patches are 1 km across
+    }
+
+    @Test func pureNoiseIsNotTreatedAsLocalDisplacement() throws {
+        let (src, dst) = patchyPairs(noise: 8, patchOffset: 0)
+        let affine = rms(try #require(TransformFitter.leaveOneOutErrors(.affine, src: src, dst: dst)))
+        let p = TransformFitter.bestParameters(.localCorrection, src: src, dst: dst, srcUnitsPerMetre: 0.5)
+        let local = rms(try #require(TransformFitter.leaveOneOutErrors(.localCorrection, src: src, dst: dst, parameters: p,
+                                                                        srcUnitsPerMetre: 0.5)))
+        #expect(local < affine * 1.1) // no worse than affine to speak of
+    }
+
+    @Test func geoReferenceReportsRangeInMetres() throws {
+        let (src, dst) = patchyPairs(noise: 3, patchOffset: 25)
+        let points = zip(src, dst).map { ControlPoint(image: Vec2($0.x, -$0.y), geo: Sweref99TM.unproject(Vec2($1.x, $1.y))) }
+        let g = try #require(GeoReference(points: points, kind: .localCorrection))
+        guard case .local(let range, _) = g.parameters else { Issue.record("expected local parameters"); return }
+        #expect(range >= 250 && range <= 2000)
+        let back = g.geoToImage(g.imageToGeo(Vec2(1500, -1000)))
+        #expect((back - Vec2(1500, -1000)).length < 1) // forward and inverse agree to within a pixel
+    }
+
+    @Test func kindNamesAreStableOnDisk() throws {
+        let data = try JSONEncoder().encode([TransformKind.localCorrection, .thinPlateSpline])
+        #expect(String(decoding: data, as: UTF8.self) == #"["localCorrection","thinPlateSpline"]"#)
+    }
+}
+
+/// Small deterministic RNG so the statistical tests are reproducible.
+struct SplitMix {
+    var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+    mutating func uniform(_ a: Double, _ b: Double) -> Double { a + (b - a) * Double(next() >> 11) / Double(1 << 53) }
 }
 
 @Suite struct GeoReferenceTests {

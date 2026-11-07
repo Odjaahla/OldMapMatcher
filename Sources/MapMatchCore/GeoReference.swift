@@ -39,7 +39,8 @@ public struct PointDiagnostics: Sendable {
 /// A fitted relationship between one old map image and the ground (SWEREF 99 TM).
 public struct GeoReference: Sendable {
     public let kind: TransformKind
-    public let lambda: Double?
+    /// Automatically chosen settings of the flexible models (nil for similarity/affine).
+    public let parameters: ModelParameters?
     let forwardT: any PlanarTransform // image (y-up) → SWEREF
     let inverseT: any PlanarTransform // SWEREF → image (y-up)
     public let diagnostics: [UUID: PointDiagnostics]
@@ -55,19 +56,22 @@ public struct GeoReference: Sendable {
         let src = points.map { GeoReference.imageToPlane($0.image) }
         let dst = points.map { Sweref99TM.project($0.geo) }
 
-        let lambda: Double? = kind == .thinPlateSpline ? TransformFitter.bestSmoothing(src: src, dst: dst) : nil
-        guard let f = TransformFitter.fit(kind, src: src, dst: dst, lambda: lambda),
-              let i = TransformFitter.fit(kind, src: dst, dst: src, lambda: lambda) else { return nil }
+        // Approximate ground scale, so local-correction ranges can be given in metres in both directions.
+        let pixelsPerMetre = Normalizer(src).scale / Normalizer(dst).scale
+        let parameters = TransformFitter.bestParameters(kind, src: src, dst: dst, srcUnitsPerMetre: pixelsPerMetre)
+        guard let f = TransformFitter.fit(kind, src: src, dst: dst, parameters: parameters, srcUnitsPerMetre: pixelsPerMetre),
+              let i = TransformFitter.fit(kind, src: dst, dst: src, parameters: parameters, srcUnitsPerMetre: 1)
+        else { return nil }
         self.kind = kind
-        self.lambda = lambda
+        self.parameters = parameters
         forwardT = f
         inverseT = i
 
-        let loo = TransformFitter.leaveOneOutErrors(kind, src: src, dst: dst, lambda: lambda)
+        let loo = TransformFitter.leaveOneOutErrors(kind, src: src, dst: dst, parameters: parameters, srcUnitsPerMetre: pixelsPerMetre)
         var diag: [UUID: PointDiagnostics] = [:]
         for (k, p) in points.enumerated() {
             let v = f.apply(src[k]) - dst[k]
-            diag[p.id] = PointDiagnostics(residual: v.length, residualVector: v, leaveOneOut: loo[k])
+            diag[p.id] = PointDiagnostics(residual: v.length, residualVector: v, leaveOneOut: loo?[k] ?? .infinity)
         }
         diagnostics = diag
     }

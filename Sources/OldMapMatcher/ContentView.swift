@@ -60,13 +60,31 @@ struct LayerList: View {
 
     var body: some View {
         List(selection: Binding(get: { state.active?.url }, set: { url in state.activate(state.documents.first { $0.url == url }) })) {
-            Section(state.mode == .explore ? "Layers (top first)" : "Maps") {
-                ForEach(state.documents) { doc in
-                    LayerRow(doc: doc, explore: state.mode == .explore)
-                        .tag(doc.url)
+            if state.mode == .explore {
+                Section("Layers (top first)") {
+                    ForEach(state.documents) { doc in
+                        LayerRow(doc: doc, explore: true)
+                            .tag(doc.url)
+                    }
+                    .onMove { state.moveLayers(from: $0, to: $1) }
                 }
-                .onMove { state.moveLayers(from: $0, to: $1) }
+            } else {
+                Section("Maps (most points first)") {
+                    ForEach(mapsByPointCount) { doc in
+                        LayerRow(doc: doc, explore: false)
+                            .tag(doc.url)
+                    }
+                }
             }
+        }
+    }
+
+    /// Match mode lists maps by progress; explore mode keeps the hand-arranged layer order.
+    private var mapsByPointCount: [MapDocument] {
+        state.documents.sorted { a, b in
+            a.enabledPointCount != b.enabledPointCount
+                ? a.enabledPointCount > b.enabledPointCount
+                : a.name.localizedStandardCompare(b.name) == .orderedAscending
         }
     }
 }
@@ -250,7 +268,17 @@ struct StatsView: View {
                         GridRow { Text("Scale at centre"); Text(String(format: "%.2f m/px", g.metresPerPixel(at: c))) }
                         GridRow { Text("Map up vs true north"); Text(String(format: "%+.1f°", g.northDeviationDegrees(at: c))) }
                     }
-                    if let l = g.lambda { GridRow { Text("Smoothing (auto)"); Text(String(format: "%g", l)) } }
+                    switch g.parameters {
+                    case .thinPlate(let l)?:
+                        GridRow { Text("Smoothing (auto)"); Text(String(format: "%g", l)) }
+                    case .local(let range, let ratio)?:
+                        GridRow { Text("Correction reach (auto)"); Text(String(format: "%.0f m", range)) }
+                            .help("How far from each point its local correction extends")
+                        GridRow { Text("Noise share (auto)"); Text(String(format: "%.0f%%", 100 * ratio * ratio / (1 + ratio * ratio))) }
+                            .help("Share of point-to-point scatter treated as clicking/drawing noise rather than real local displacement")
+                    case nil:
+                        EmptyView()
+                    }
                 }
                 .font(.callout)
                 .monospacedDigit()

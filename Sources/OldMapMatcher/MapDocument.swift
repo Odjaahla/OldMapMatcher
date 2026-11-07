@@ -23,6 +23,8 @@ final class MapDocument: ObservableObject, Identifiable {
     @Published var points: [ControlPoint] = [] { didSet { if oldValue != points { changed() } } }
     @Published var kind: TransformKind = .similarity { didSet { if oldValue != kind { changed() } } }
     @Published private(set) var geoRef: GeoReference?
+    /// True while a refit is running in the background.
+    @Published private(set) var fitting = false
     /// Left-out error (RMS, metres) for each model on the current points; missing = too few points.
     @Published private(set) var modelComparison: [TransformKind: Double] = [:]
     @Published private(set) var loadError: String?
@@ -76,20 +78,31 @@ final class MapDocument: ObservableObject, Identifiable {
     // MARK: Fitting
 
     private func changed() {
-        refit()
+        refit() // updates the overlay when done
         save()
-        updateOverlay()
     }
 
+    private var fitTask: Task<Void, Never>?
+
+    /// Fits all models in the background (automatic parameter selection gets slow with many points)
+    /// and publishes the result unless a newer edit has superseded it.
     private func refit() {
-        geoRef = GeoReference(points: points, kind: kind)
-            ?? (kind != .similarity ? GeoReference(points: points, kind: .similarity) : nil)
-        var comparison: [TransformKind: Double] = [:]
-        for k in TransformKind.allCases {
-            let g = k == geoRef?.kind ? geoRef : GeoReference(points: points, kind: k)
-            if let v = g?.rmsLeaveOneOut { comparison[k] = v }
+        fitTask?.cancel()
+        fitting = true
+        let points = points, kind = kind
+        fitTask = Task {
+            let (g, comparison) = await Task.detached(priority: .userInitiated) { () -> (GeoReference?, [TransformKind: Double]) in
+                var fits: [TransformKind: GeoReference] = [:]
+                for k in TransformKind.allCases { fits[k] = GeoReference(points: points, kind: k) }
+                let g = fits[kind] ?? (kind != .similarity ? fits[.similarity] : nil)
+                return (g, fits.compactMapValues(\.rmsLeaveOneOut))
+            }.value
+            guard !Task.isCancelled else { return }
+            geoRef = g
+            modelComparison = comparison
+            fitting = false
+            updateOverlay()
         }
-        modelComparison = comparison
     }
 
     private func save() {

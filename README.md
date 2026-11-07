@@ -23,7 +23,11 @@ On first launch choose this folder as the project folder (File → Open Project 
   there. Press ↩ to accept the prediction as-is.
 - Hovering over either map shows the corresponding spot on the other (teal crosshair).
 - **Model**: *Similarity* (rotation and scale), *Affine* (adds uneven paper shrinkage), or
-  *Thin-plate spline* (adds smooth local bending, with smoothing picked automatically by cross-validation).
+  *Affine + local correction* (adds corrections that only reach a few hundred metres from each point;
+  this suits maps compiled from separately surveyed pieces, where nearby features share an offset), or
+  *Thin-plate spline* (adds smooth bending of the whole sheet). The flexible models choose their settings
+  automatically by cross-validation. The stats panel compares all models; pick the one with the lowest
+  left-out error.
 - **Residuals** draws arrows from each clicked point to where the model places it. If neighbouring
   arrows point the same way, the old map is warped and the spline is worth using. If they point in
   random directions, the errors are just noise; a stiffer model is better and a spline would overfit.
