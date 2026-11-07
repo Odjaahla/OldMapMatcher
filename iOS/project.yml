@@ -1,0 +1,33 @@
+# iPhone companion app: shows the maps exported by the Mac app (File › Export for iPhone) over a
+# modern map with your GPS position. Generate the Xcode project with `xcodegen` in this folder,
+# or build and install with scripts/build_phone.sh.
+name: OldMaps
+options:
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  OldMapMatcher:
+    path: ..
+targets:
+  OldMaps:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    dependencies:
+      - package: OldMapMatcher
+        product: MapLayers
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.github.odjaahla.oldmaps
+        DEVELOPMENT_TEAM: 7N4T98CNSL
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5"
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Old Maps
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Shows where you are on the old maps.
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

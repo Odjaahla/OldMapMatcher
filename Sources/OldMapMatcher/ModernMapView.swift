@@ -1,5 +1,6 @@
 import Combine
 import MapKit
+import MapLayers
 import MapMatchCore
 import SwiftUI
 
@@ -20,21 +21,6 @@ final class PendingAnnotation: MKPointAnnotation {}
 final class PredictedAnnotation: MKPointAnnotation {}
 final class CursorAnnotation: MKPointAnnotation {}
 final class ResidualLine: MKPolyline {}
-
-/// OpenStreetMap tiles with an identifying User-Agent, as the OSM tile policy asks.
-final class OSMTileOverlay: MKTileOverlay {
-    init() {
-        super.init(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-        canReplaceMapContent = true
-        maximumZ = 19
-    }
-
-    override func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
-        var req = URLRequest(url: url(forTilePath: path))
-        req.setValue("OldMapMatcher/0.1 (personal historical map research)", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { data, _, error in result(data, error) }.resume()
-    }
-}
 
 /// MKMapView that reports the coordinate under the mouse and hosts the correction-drag layer.
 final class HoverMapView: MKMapView {

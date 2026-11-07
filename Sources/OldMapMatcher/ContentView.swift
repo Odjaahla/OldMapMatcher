@@ -41,6 +41,9 @@ struct ContentView: View {
             }
         }
         .navigationTitle(state.active?.name ?? "Old Map Matcher")
+        .alert(state.exportMessage ?? "", isPresented: Binding(get: { state.exportMessage != nil }, set: { if !$0 { state.exportMessage = nil } })) {
+            Button("OK") {}
+        }
         .toolbar {
             ToolbarItem(placement: .principal) {
                 Picker("Mode", selection: $state.mode) {

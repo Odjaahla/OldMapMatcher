@@ -16,6 +16,10 @@ struct OldMapMatcherApp: App {
                     .keyboardShortcut("o")
                 Button("Rescan Images") { state.rescan() }
                     .keyboardShortcut("r")
+                Divider()
+                Button(state.exporting ? "Exporting for iPhone…" : "Export for iPhone") { state.exportForPhone() }
+                    .keyboardShortcut("e")
+                    .disabled(state.exporting)
             }
             CommandMenu("Mode") {
                 Button("Match Points") { state.mode = .match }

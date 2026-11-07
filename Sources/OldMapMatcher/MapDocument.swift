@@ -2,6 +2,7 @@ import Combine
 import CoreGraphics
 import Foundation
 import ImageIO
+import MapLayers
 import MapMatchCore
 
 /// On-disk control points for one map: `gcps/<image file name>.json`.
@@ -143,18 +144,7 @@ final class MapDocument: ObservableObject, Identifiable {
         guard raster == nil, rasterTask == nil else { return }
         let url = url
         rasterTask = Task {
-            let result = await Task.detached(priority: .userInitiated) { () -> (SourceRaster, Vec2)? in
-                guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-                      let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-                      let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int,
-                      let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [
-                          kCGImageSourceCreateThumbnailFromImageAlways: true,
-                          kCGImageSourceThumbnailMaxPixelSize: SourceRaster.maxDimension,
-                          kCGImageSourceCreateThumbnailWithTransform: true,
-                      ] as CFDictionary)
-                else { return nil }
-                return (SourceRaster(thumb, originalWidth: w), Vec2(Double(w), Double(h)))
-            }.value
+            let result = await Task.detached(priority: .userInitiated) { SourceRaster.load(url) }.value
             rasterTask = nil
             guard let (r, size) = result else { loadError = "Could not read \(url.lastPathComponent)"; return }
             raster = r

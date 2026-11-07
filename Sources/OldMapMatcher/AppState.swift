@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import MapKit
+import MapLayers
 import MapMatchCore
 import SwiftUI
 
@@ -123,6 +124,46 @@ final class AppState: ObservableObject {
             }
         }
         if mode == .match { syncImageToMapSoon() }
+        if CommandLine.arguments.contains("--export-for-phone") { exportAndQuit() }
+    }
+
+    /// `OldMapMatcher --export-for-phone`: export once fits are done, print the result and quit.
+    private func exportAndQuit() {
+        Task {
+            while documents.contains(where: \.fitting) { try? await Task.sleep(for: .milliseconds(100)) }
+            exportForPhone()
+            while exporting { try? await Task.sleep(for: .milliseconds(100)) }
+            print(exportMessage ?? "")
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    // MARK: Export
+
+    @Published private(set) var exporting = false
+    /// Result of the last export, shown as an alert.
+    @Published var exportMessage: String?
+
+    /// Writes all georeferenced maps, in layer order, to iCloud Drive for the iPhone app.
+    func exportForPhone() {
+        guard !exporting else { return }
+        let jobs = documents.compactMap { d in
+            d.geoRef.map { Exporter.Job(imageURL: d.url, name: d.name, geoRef: $0, points: d.enabledPointCount,
+                                        visible: d.visible, opacity: d.opacity) }
+        }
+        guard !jobs.isEmpty else { exportMessage = "No maps have enough points to export yet."; return }
+        exporting = true
+        let folder = Exporter.defaultFolder
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { Result { try Exporter.export(jobs, to: folder) } }.value
+            exporting = false
+            switch result {
+            case .success(let n):
+                exportMessage = "Exported \(n) map\(n == 1 ? "" : "s") to iCloud Drive › Old Map Matcher. They appear on the iPhone once iCloud has synced."
+            case .failure(let e):
+                exportMessage = "Export failed: \(e.localizedDescription)"
+            }
+        }
     }
 
     // MARK: Workspace

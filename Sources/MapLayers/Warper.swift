@@ -1,20 +1,22 @@
 import CoreGraphics
+import Foundation
+import ImageIO
 import MapKit
 import MapMatchCore
 
 /// A downsampled RGBA copy of the old map used as the source for warping.
-struct SourceRaster: @unchecked Sendable {
-    let width: Int
-    let height: Int
+public struct SourceRaster: @unchecked Sendable {
+    public let width: Int
+    public let height: Int
     let pixels: [UInt8] // premultiplied RGBA, row 0 = top of image
     /// Original image pixels per raster pixel.
-    let factor: Double
+    public let factor: Double
 
-    static let maxDimension = 4096
+    public static let maxDimension = 4096
 
     /// `image` may be a downsampled thumbnail; `originalWidth` is the full image's width in pixels,
     /// which is the coordinate system control points use.
-    init(_ image: CGImage, originalWidth: Int) {
+    public init(_ image: CGImage, originalWidth: Int) {
         let f = max(1, Double(max(image.width, image.height)) / Double(SourceRaster.maxDimension))
         width = Int((Double(image.width) / f).rounded())
         height = Int((Double(image.height) / f).rounded())
@@ -30,22 +32,37 @@ struct SourceRaster: @unchecked Sendable {
         }
         pixels = buf
     }
+
+    /// Reads a downsampled copy of an image file without decoding it at full size.
+    /// Returns the raster and the full image's size in pixels (the control points' coordinate system).
+    public static func load(_ url: URL) -> (SourceRaster, Vec2)? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int,
+              let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxDimension,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+              ] as CFDictionary)
+        else { return nil }
+        return (SourceRaster(thumb, originalWidth: w), Vec2(Double(w), Double(h)))
+    }
 }
 
 /// The old map warped into Web Mercator so MapKit can draw it on top of the modern map.
-final class WarpedImageOverlay: NSObject, MKOverlay, @unchecked Sendable {
-    let image: CGImage
-    let boundingMapRect: MKMapRect
-    var coordinate: CLLocationCoordinate2D { MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate }
+public final class WarpedImageOverlay: NSObject, MKOverlay, @unchecked Sendable {
+    public let image: CGImage
+    public let boundingMapRect: MKMapRect
+    public var coordinate: CLLocationCoordinate2D { MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate }
 
-    init(image: CGImage, rect: MKMapRect) {
+    public init(image: CGImage, rect: MKMapRect) {
         self.image = image
         boundingMapRect = rect
     }
 }
 
-final class WarpedImageRenderer: MKOverlayRenderer {
-    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+public final class WarpedImageRenderer: MKOverlayRenderer {
+    override public func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
         guard let o = overlay as? WarpedImageOverlay else { return }
         let r = rect(for: o.boundingMapRect)
         context.saveGState()
@@ -58,14 +75,14 @@ final class WarpedImageRenderer: MKOverlayRenderer {
     }
 }
 
-enum Warper {
+public enum Warper {
     static let maxOutputDimension = 4096
     static let gridStep = 8
 
     /// Resamples the old map onto a Web Mercator grid by inverse mapping:
     /// for each output pixel, ask the fitted model where it lies on the old map.
     /// The exact model is evaluated on a coarse grid and interpolated in between.
-    static func warp(_ src: SourceRaster, imageSize: Vec2, geoRef: GeoReference) -> WarpedImageOverlay? {
+    public static func warp(_ src: SourceRaster, imageSize: Vec2, geoRef: GeoReference) -> WarpedImageOverlay? {
         // Footprint: trace the image border onto the ground.
         var minX = Double.infinity, minY = Double.infinity, maxX = -Double.infinity, maxY = -Double.infinity
         var minE = Double.infinity, maxE = -Double.infinity, minN = Double.infinity, maxN = -Double.infinity
@@ -144,5 +161,20 @@ enum Warper {
                                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
         else { return nil }
         return WarpedImageOverlay(image: cg, rect: rect)
+    }
+}
+
+/// OpenStreetMap tiles with an identifying User-Agent, as the OSM tile policy asks.
+public final class OSMTileOverlay: MKTileOverlay {
+    public init() {
+        super.init(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+        canReplaceMapContent = true
+        maximumZ = 19
+    }
+
+    override public func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
+        var req = URLRequest(url: url(forTilePath: path))
+        req.setValue("OldMapMatcher/0.1 (personal historical map research)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, _, error in result(data, error) }.resume()
     }
 }
