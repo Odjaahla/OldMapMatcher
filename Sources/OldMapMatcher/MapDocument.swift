@@ -33,7 +33,7 @@ final class MapDocument: ObservableObject, Identifiable {
     /// Full-resolution image, loaded only while the map is being matched.
     @Published private(set) var image: CGImage?
     @Published private(set) var imageSize: Vec2?
-    @Published private(set) var overlay: WarpedImageOverlay?
+    @Published private(set) var overlay: LiveWarpOverlay?
     @Published private(set) var overlayBusy = false
 
     // Layer settings (persisted by AppState).
@@ -51,10 +51,9 @@ final class MapDocument: ObservableObject, Identifiable {
         }
     }
 
-    private var raster: SourceRaster?
-    private var rasterTask: Task<Void, Never>?
+    private var source: SourcePyramid?
+    private var sourceTask: Task<Void, Never>?
     private var imageTask: Task<Void, Never>?
-    private var overlayTask: Task<Void, Never>?
 
     init(url: URL, gcpDirectory: URL) {
         self.url = url
@@ -139,40 +138,33 @@ final class MapDocument: ObservableObject, Identifiable {
         }
     }
 
-    /// Loads a downsampled copy for warping without decoding the full image.
-    private func loadRaster() {
-        guard raster == nil, rasterTask == nil else { return }
+    /// Loads the full-resolution source for the overlay (about 4 bytes per pixel, plus a third for the
+    /// smaller copies); it's released again when no overlay is wanted.
+    private func loadSource() {
+        guard source == nil, sourceTask == nil else { return }
         let url = url
-        rasterTask = Task {
-            let result = await Task.detached(priority: .userInitiated) { SourceRaster.load(url) }.value
-            rasterTask = nil
-            guard let (r, size) = result else { loadError = "Could not read \(url.lastPathComponent)"; return }
-            raster = r
-            if imageSize == nil { imageSize = size }
+        overlayBusy = true
+        sourceTask = Task {
+            let result = await Task.detached(priority: .userInitiated) { SourcePyramid.load(url) }.value
+            sourceTask = nil
+            guard wantsOverlay else { overlayBusy = false; return }
+            guard let result else { loadError = "Could not read \(url.lastPathComponent)"; overlayBusy = false; return }
+            source = result
+            if imageSize == nil { imageSize = result.imageSize }
             updateOverlay()
         }
     }
 
     // MARK: Overlay
 
+    /// Tiles are warped as MapKit draws them, so a new fit only needs a new overlay object.
     private func updateOverlay() {
-        overlayTask?.cancel()
         guard wantsOverlay else {
-            overlay = nil; overlayBusy = false; raster = nil
+            overlay = nil; overlayBusy = false; source = nil
             return
         }
-        guard let raster, let size = imageSize else { loadRaster(); return }
-        guard let geoRef else { overlay = nil; overlayBusy = false; return }
-        overlayBusy = true
-        overlayTask = Task {
-            try? await Task.sleep(for: .milliseconds(120)) // coalesce bursts of edits
-            guard !Task.isCancelled else { return }
-            let result = await Task.detached(priority: .userInitiated) {
-                Warper.warp(raster, imageSize: size, geoRef: geoRef)
-            }.value
-            guard !Task.isCancelled else { return }
-            overlay = result
-            overlayBusy = false
-        }
+        guard let source else { loadSource(); return }
+        overlayBusy = false
+        overlay = geoRef.flatMap { LiveWarpOverlay(source: source, geoRef: $0) }
     }
 }

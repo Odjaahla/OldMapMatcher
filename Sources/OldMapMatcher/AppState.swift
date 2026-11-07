@@ -276,7 +276,7 @@ final class AppState: ObservableObject {
     }
 
     /// Overlays to draw, bottom to top, with their opacity.
-    var displayedOverlays: [(overlay: WarpedImageOverlay, opacity: Double)] {
+    var displayedOverlays: [(overlay: LiveWarpOverlay, opacity: Double)] {
         switch mode {
         case .match:
             guard showOverlay, let o = active?.overlay else { return [] }

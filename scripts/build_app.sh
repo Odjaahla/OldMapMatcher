@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Builds OldMapMatcher.app from the Swift package (no Xcode project needed).
-# Usage: scripts/build_app.sh [--open]
+# Usage: scripts/build_app.sh [--open | --install]
+#   --install copies it to /Applications (replacing an earlier copy) and opens it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,3 +37,11 @@ PLIST
 codesign --force --sign - "$APP" >/dev/null
 echo "Built $APP"
 if [[ "${1:-}" == "--open" ]]; then open "$APP"; fi
+if [[ "${1:-}" == "--install" ]]; then
+    osascript -e 'quit app id "com.github.odjaahla.oldmapmatcher"' 2>/dev/null || true
+    DEST="/Applications/Old Map Matcher.app"
+    rm -rf "$DEST"
+    cp -R "$APP" "$DEST"
+    echo "Installed $DEST"
+    open "$DEST"
+fi

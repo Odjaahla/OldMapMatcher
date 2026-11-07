@@ -128,8 +128,8 @@ struct ModernMapView: NSViewRepresentable {
         let pending = PendingAnnotation()
         let predicted = PredictedAnnotation()
         let cursor = CursorAnnotation()
-        var warped: [WarpedImageOverlay] = []
-        var renderers: [ObjectIdentifier: WarpedImageRenderer] = [:]
+        var warped: [LiveWarpOverlay] = []
+        var renderers: [ObjectIdentifier: LiveWarpRenderer] = [:]
         var opacities: [ObjectIdentifier: Double] = [:]
         var residualKey: [Double] = []
         var lastFocus: UUID?
@@ -246,8 +246,8 @@ struct ModernMapView: NSViewRepresentable {
             switch overlay {
             case let t as MKTileOverlay:
                 return MKTileOverlayRenderer(tileOverlay: t)
-            case let w as WarpedImageOverlay:
-                let r = WarpedImageRenderer(overlay: w)
+            case let w as LiveWarpOverlay:
+                let r = LiveWarpRenderer(overlay: w)
                 r.alpha = CGFloat(opacities[ObjectIdentifier(w)] ?? 0.7)
                 renderers[ObjectIdentifier(w)] = r
                 return r
