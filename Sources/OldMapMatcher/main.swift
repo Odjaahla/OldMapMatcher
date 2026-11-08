@@ -9,6 +9,10 @@ struct OldMapMatcherApp: App {
             ContentView()
                 .environmentObject(state)
                 .frame(minWidth: 1000, minHeight: 650)
+                // Pick up points added on the iPhone whenever the app comes to the front.
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    state.mergePhoneEdits()
+                }
         }
         .commands {
             CommandGroup(after: .newItem) {

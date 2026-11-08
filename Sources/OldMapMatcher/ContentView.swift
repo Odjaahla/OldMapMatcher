@@ -132,54 +132,73 @@ struct LayerRow: View {
 struct ControlBar: View {
     @EnvironmentObject var state: AppState
 
+    /// One row when the window is wide enough, otherwise map choices above display options.
     var body: some View {
-        HStack(spacing: 14) {
-            if let doc = state.active {
-                ModelPicker(doc: doc)
-            }
-            Picker("Base map", selection: $state.baseLayer) {
-                ForEach(BaseLayer.allCases) { Text($0.displayName).tag($0) }
-            }
-            .pickerStyle(.menu)
-            .frame(width: 190)
-            Toggle("Residuals", isOn: $state.showResiduals)
-                .help("Arrows from each clicked point to where the model places it")
-            Toggle("Uncertainty", isOn: $state.showUncertainty)
-                .help("Shade the active map by how far off its fit is likely to be. Add points where it's red.")
-                .disabled(state.active?.uncertaintyOverlay == nil)
-            if state.showUncertainty, state.active?.uncertaintyOverlay != nil { UncertaintyLegend() }
-            switch state.mode {
-            case .match:
-                Toggle("Overlay", isOn: $state.showOverlay)
-                    .help("Draw the warped old map on top of the modern map")
-                    .disabled(state.geoRef == nil)
-                Slider(value: $state.overlayOpacity, in: 0...1)
-                    .frame(width: 110)
-                    .disabled(!state.showOverlay)
-                    .help("Overlay opacity")
-                Button { state.syncImageToMap() } label: { Label("Align views", systemImage: "viewfinder") }
-                    .disabled(state.geoRef == nil)
-                    .keyboardShortcut("l", modifiers: .command)
-                    .help("Show the old map at the same place and scale as the modern map (⌘L)")
-            case .explore:
-                Toggle("Points", isOn: $state.showMarkers)
-                    .help("Show the active map's control points")
-            }
-            if state.overlayBusy { ProgressView().controlSize(.small) }
-            Spacer()
-            if let status = state.exportStatus {
-                ProgressView().controlSize(.small)
-                Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            if state.mode == .explore {
-                Text(state.peeking ? "Showing modern map" : "⌥-drag: correct active map · hold Space: hide layers")
-                    .font(.caption)
-                    .foregroundStyle(state.peeking ? .orange : .secondary)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) { pickers; options; Spacer(minLength: 0); status }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 14) { pickers; Spacer(minLength: 0); status }
+                HStack(spacing: 14) { options; Spacer(minLength: 0) }
             }
         }
         .toggleStyle(.checkbox)
+        .lineLimit(1)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
+    }
+
+    @ViewBuilder private var pickers: some View {
+        if let doc = state.active {
+            ModelPicker(doc: doc)
+        }
+        Picker("Base map", selection: $state.baseLayer) {
+            ForEach(BaseLayer.allCases) { Text($0.displayName).tag($0) }
+        }
+        .pickerStyle(.menu)
+        .frame(width: 190)
+    }
+
+    @ViewBuilder private var options: some View {
+        Toggle("Residuals", isOn: $state.showResiduals)
+            .fixedSize()
+            .help("Arrows from each clicked point to where the model places it")
+        Toggle("Uncertainty", isOn: $state.showUncertainty)
+            .fixedSize()
+            .help("Shade the active map by how far off its fit is likely to be. Add points where it's red.")
+            .disabled(state.active?.uncertaintyOverlay == nil)
+        if state.showUncertainty, state.active?.uncertaintyOverlay != nil { UncertaintyLegend().fixedSize() }
+        switch state.mode {
+        case .match:
+            Toggle("Overlay", isOn: $state.showOverlay)
+                .fixedSize()
+                .help("Draw the warped old map on top of the modern map")
+                .disabled(state.geoRef == nil)
+            Slider(value: $state.overlayOpacity, in: 0...1)
+                .frame(width: 110)
+                .disabled(!state.showOverlay)
+                .help("Overlay opacity")
+            Button { state.syncImageToMap() } label: { Label("Align views", systemImage: "viewfinder") }
+                .fixedSize()
+                .disabled(state.geoRef == nil)
+                .keyboardShortcut("l", modifiers: .command)
+                .help("Show the old map at the same place and scale as the modern map (⌘L)")
+        case .explore:
+            Toggle("Points", isOn: $state.showMarkers)
+                .fixedSize()
+                .help("Show the active map's control points")
+            Text(state.peeking ? "Showing modern map" : "⌥-drag: correct active map · hold Space: hide layers")
+                .font(.caption)
+                .foregroundStyle(state.peeking ? .orange : .secondary)
+                .fixedSize()
+        }
+        if state.overlayBusy { ProgressView().controlSize(.small) }
+    }
+
+    @ViewBuilder private var status: some View {
+        if let status = state.exportStatus {
+            ProgressView().controlSize(.small)
+            Text(status).font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 

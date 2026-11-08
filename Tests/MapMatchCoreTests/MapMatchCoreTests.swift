@@ -1,4 +1,5 @@
 import Foundation
+import MapLayers
 import Testing
 @testable import MapMatchCore
 
@@ -252,5 +253,31 @@ struct SplitMix {
         let p = [ControlPoint(image: Vec2(0, 0), geo: LatLon(lat: 59.28, lon: 17.95)),
                  ControlPoint(image: Vec2(100, 0), geo: LatLon(lat: 59.28, lon: 17.96), enabled: false)]
         #expect(GeoReference(points: p, kind: .similarity) == nil)
+    }
+}
+
+@Suite struct PhoneEditTests {
+    let a = ControlPoint(name: "a", image: Vec2(1, 1), geo: LatLon(lat: 59.3, lon: 18))
+    let b = ControlPoint(name: "b", image: Vec2(2, 2), geo: LatLon(lat: 59.31, lon: 18.01))
+
+    @Test func appliesInOrderAndTwiceIsHarmless() {
+        let c = ControlPoint(name: "c", image: Vec2(3, 3), geo: LatLon(lat: 59.32, lon: 18.02))
+        let edits = [PhoneEdit(map: "m", action: .add, point: c),
+                     PhoneEdit(map: "m", action: .disable, pointID: a.id),
+                     PhoneEdit(map: "m", action: .delete, pointID: b.id)]
+        let once = PhoneEdits.apply(edits, to: [a, b])
+        #expect(once.map(\.name) == ["a", "c"])
+        #expect(once[0].enabled == false)
+        #expect(PhoneEdits.apply(edits, to: once) == once)
+    }
+
+    @Test func editsToPointsDeletedOnTheMacAreSkipped() {
+        let edits = [PhoneEdit(map: "m", action: .enable, pointID: b.id), PhoneEdit(map: "m", action: .delete, pointID: b.id)]
+        #expect(PhoneEdits.apply(edits, to: [a]) == [a])
+    }
+
+    @Test func roundTripsThroughJSON() throws {
+        let e = PhoneEdits(edits: [PhoneEdit(map: "m", action: .add, point: a)])
+        #expect(try PhoneEdits.decode(e.encoded()).edits.first?.point == a)
     }
 }

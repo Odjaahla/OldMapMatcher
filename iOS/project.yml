@@ -16,6 +16,8 @@ targets:
     dependencies:
       - package: OldMapMatcher
         product: MapLayers
+      - package: OldMapMatcher
+        product: MapMatchCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.github.odjaahla.oldmaps

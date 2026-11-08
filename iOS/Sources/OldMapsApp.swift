@@ -22,11 +22,19 @@ struct RootView: View {
     @EnvironmentObject var store: LayerStore
     @State private var showLayers = false
     @State private var choosingFolder = false
+    /// The map a point is being added to; nil when not adding.
+    @State private var adding: String?
+    @State private var choosingMap = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             MapScreen(store: store)
                 .ignoresSafeArea()
+            if adding != nil {
+                Crosshair()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
+            }
 
             VStack(spacing: 10) {
                 if let s = store.status {
@@ -34,6 +42,8 @@ struct RootView: View {
                 }
                 if store.maps.isEmpty {
                     emptyState
+                } else if let m = adding {
+                    AddPointPanel(map: m) { adding = nil }
                 } else {
                     fadeBar
                 }
@@ -44,6 +54,9 @@ struct RootView: View {
         .sheet(isPresented: $showLayers) {
             LayerSheet(choosingFolder: $choosingFolder)
                 .presentationDetents([.medium, .large])
+        }
+        .confirmationDialog("Add a point to which map?", isPresented: $choosingMap, titleVisibility: .visible) {
+            ForEach(addableMaps) { m in Button(m.name) { adding = m.name } }
         }
         .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { store.setFolder(url) }
@@ -56,6 +69,9 @@ struct RootView: View {
             Image(systemName: "map").foregroundStyle(.secondary)
             Slider(value: $store.fade, in: 0...1)
             Image(systemName: "scroll").foregroundStyle(.secondary)
+            Button { startAdding() } label: {
+                Image(systemName: "mappin.and.ellipse").font(.title3)
+            }
             Button { showLayers = true } label: {
                 Image(systemName: "square.3.layers.3d").font(.title3)
             }
@@ -66,6 +82,24 @@ struct RootView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(.regularMaterial, in: Capsule())
+    }
+
+    /// Visible maps that can take new points.
+    private var addableMaps: [FieldMap] { store.editableMaps.filter { store.visible.contains($0.name) } }
+
+    private func startAdding() {
+        let maps = addableMaps
+        if maps.isEmpty {
+            store.notify(store.editableMaps.isEmpty
+                ? "Export again from the Mac app first: older exports don't include the points needed for adding."
+                : "Show the map you want to add a point to (Layers), then try again.")
+        } else if maps.count == 1 {
+            adding = maps[0].name
+        } else if let e = store.editMap, maps.contains(where: { $0.name == e }), store.showPoints {
+            adding = e
+        } else {
+            choosingMap = true
+        }
     }
 
     private var emptyState: some View {
@@ -92,6 +126,22 @@ struct LayerSheet: View {
             List {
                 Section("Old maps (top first)") {
                     ForEach(store.maps) { m in row(m) }
+                }
+                if !store.editableMaps.isEmpty {
+                    Section("Points") {
+                        ForEach(store.editableMaps) { m in
+                            NavigationLink {
+                                PointsList(map: m.name) { dismiss() }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(m.name).lineLimit(1).truncationMode(.middle)
+                                    let pending = store.pendingCount(for: m.name)
+                                    Text("\(store.points(for: m.name).count) points" + (pending > 0 ? " · \(pending) waiting for the Mac" : ""))
+                                        .font(.caption).foregroundStyle(pending > 0 ? .orange : .secondary)
+                                }
+                            }
+                        }
+                    }
                 }
                 Section("Modern map") {
                     Picker("Base map", selection: $store.baseMap) {

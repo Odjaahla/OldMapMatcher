@@ -151,20 +151,28 @@ final class AppState: ObservableObject {
     @Published var exportMessage: String?
 
     /// Writes all georeferenced maps, in layer order, to iCloud Drive for the iPhone app.
+    /// Merges the phone's edits first, so they are part of the export.
     func exportForPhone() {
         guard !exporting else { return }
-        let jobs = documents.compactMap { d in
-            d.geoRef.map { Exporter.Job(imageURL: d.url, name: d.name, points: d.points, geoRef: $0,
-                                        visible: d.visible, opacity: d.opacity) }
-        }
-        guard !jobs.isEmpty else { exportMessage = "No maps have enough points to export yet."; return }
         exporting = true
         exportStatus = "Exporting…"
-        let folder = Exporter.defaultFolder
+        mergePhoneEdits(announce: false)
         Task {
+            // Wait for refits started by merged edits.
+            while documents.contains(where: \.fitting) { try? await Task.sleep(for: .milliseconds(100)) }
+            let jobs = documents.compactMap { d in
+                d.geoRef.map { Exporter.Job(imageURL: d.url, name: d.name, points: d.points, geoRef: $0,
+                                            visible: d.visible, opacity: d.opacity, imageSize: d.imageSize) }
+            }
+            guard !jobs.isEmpty else {
+                exporting = false; exportStatus = nil
+                exportMessage = "No maps have enough points to export yet."
+                return
+            }
+            let folder = Exporter.defaultFolder, applied = Array(appliedPhoneEdits)
             let result = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try Exporter.export(jobs, to: folder) { status in
+                    try Exporter.export(jobs, appliedEdits: applied, to: folder) { status in
                         Task { @MainActor in if self.exporting { self.exportStatus = status } }
                     }
                 }
@@ -174,13 +182,50 @@ final class AppState: ObservableObject {
             switch result {
             case .success(let r):
                 let unchanged = r.maps - r.rendered
-                exportMessage = "Exported \(r.maps) map\(r.maps == 1 ? "" : "s") to iCloud Drive › Old Map Matcher "
+                exportMessage = (pendingMergeNote.map { $0 + "\n\n" } ?? "")
+                    + "Exported \(r.maps) map\(r.maps == 1 ? "" : "s") to iCloud Drive › Old Map Matcher "
                     + "(\(r.rendered) updated\(unchanged > 0 ? ", \(unchanged) unchanged" : ""); \(Int(r.megabytes.rounded())) MB in all). "
                     + "They appear on the iPhone once iCloud has synced."
             case .failure(let e):
                 exportMessage = "Export failed: \(e.localizedDescription)"
             }
+            pendingMergeNote = nil
         }
+    }
+
+    // MARK: Edits from the iPhone
+
+    /// IDs of phone edits already merged, so each is applied once.
+    private var appliedPhoneEdits: Set<UUID> {
+        get { Set((defaults.stringArray(forKey: "appliedPhoneEdits") ?? []).compactMap(UUID.init)) }
+        set { defaults.set(newValue.map(\.uuidString), forKey: "appliedPhoneEdits") }
+    }
+    private var pendingMergeNote: String?
+
+    /// Applies points added, unticked or deleted on the phone to the maps' point files.
+    func mergePhoneEdits(announce: Bool = true) {
+        let url = Exporter.defaultFolder.appendingPathComponent(PhoneEdits.fileName)
+        // The coordinated read waits for iCloud to download the file if needed; a missing file reads as nil.
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+        var data: Data?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: nil) { data = try? Data(contentsOf: $0) }
+        guard let data, let all = try? PhoneEdits.decode(data) else { return }
+        var applied = appliedPhoneEdits
+        let new = all.edits.filter { !applied.contains($0.id) }
+        var summary: [String] = []
+        for doc in documents {
+            let mine = new.filter { $0.map == doc.name }
+            guard !mine.isEmpty else { continue }
+            doc.points = PhoneEdits.apply(mine, to: doc.points)
+            applied.formUnion(mine.map(\.id))
+            let adds = mine.filter { $0.action == .add }.count, other = mine.count - adds
+            summary.append("\(doc.name): " + [adds > 0 ? "\(adds) added" : nil, other > 0 ? "\(other) changed" : nil]
+                .compactMap { $0 }.joined(separator: ", "))
+        }
+        appliedPhoneEdits = applied
+        guard !summary.isEmpty else { return }
+        let note = "Merged points from the iPhone:\n" + summary.joined(separator: "\n")
+        if announce { exportMessage = note + "\n\nExport for iPhone (⌘E) to update the maps there." } else { pendingMergeNote = note }
     }
 
     // MARK: Workspace
@@ -240,6 +285,7 @@ final class AppState: ObservableObject {
             activate(docs.first { $0.url.lastPathComponent == last } ?? docs.first)
         }
         updateDocumentNeeds()
+        mergePhoneEdits()
     }
 
     private func layersChanged() {

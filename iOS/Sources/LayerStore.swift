@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 import MapKit
 import MapLayers
+import MapMatchCore
 
 enum BaseMap: String, CaseIterable, Identifiable {
     case appleStandard, appleMuted, appleSatellite, openStreetMap
@@ -27,7 +28,7 @@ final class LayerStore: ObservableObject {
     @Published private(set) var maps: [FieldMap] = []
     @Published private(set) var exported: Date?
     @Published private(set) var folderName: String?
-    @Published private(set) var status: String?
+    @Published var status: String?
     @Published private(set) var loading = false
     /// Overlays of visible maps: tile layers, or decoded images from older exports.
     @Published private(set) var overlays: [String: MKOverlay] = [:]
@@ -42,12 +43,32 @@ final class LayerStore: ObservableObject {
         didSet { defaults.set(baseMap.rawValue, forKey: "baseMap") }
     }
 
-    private let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    // Editing points (see LayerStore+Points.swift).
+    /// Changes made on the phone that the Mac hasn't merged and exported yet, oldest first.
+    @Published var edits: [PhoneEdit] = []
+    /// Each map's model, refitted from its exported points: turns a spot on the overlay into old-map pixels.
+    @Published var fits: [String: GeoReference] = [:]
+    /// The map whose points are listed, shown and added to.
+    @Published var editMap: String? = UserDefaults.standard.string(forKey: "editMap") {
+        didSet { defaults.set(editMap, forKey: "editMap") }
+    }
+    @Published var showPoints = UserDefaults.standard.bool(forKey: "showPoints") {
+        didSet { defaults.set(showPoints, forKey: "showPoints") }
+    }
+    /// Spots marked while adding a point: the feature on the old map and where it is today.
+    @Published var draftOld: CLLocationCoordinate2D?
+    @Published var draftNew: CLLocationCoordinate2D?
+    /// Set by the map view.
+    var mapCenter: (() -> CLLocationCoordinate2D?)?
+    var focusMap: ((CLLocationCoordinate2D) -> Void)?
+
+    let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Pack", isDirectory: true)
     private var loadingImages: Set<String> = []
 
     init() {
         folderName = defaults.string(forKey: "folderName")
+        loadEdits()
         if let data = try? Data(contentsOf: cacheDir.appendingPathComponent(FieldPack.manifestName)),
            let pack = try? FieldPack.decode(data) {
             apply(pack)
@@ -80,6 +101,7 @@ final class LayerStore: ObservableObject {
             return
         }
         if stale, let fresh = try? folder.bookmarkData() { defaults.set(fresh, forKey: "folderBookmark") }
+        pushEdits() // retry, in case an earlier save happened offline
         loading = true
         let current = exported, cacheDir = cacheDir
         Task {
@@ -168,6 +190,7 @@ final class LayerStore: ObservableObject {
         if vis.isEmpty, let first = pack.maps.first { vis.insert(first.name) }
         opacity = op
         visible = vis
+        packChanged(pack)
     }
 
     private func saveLayerSettings() {

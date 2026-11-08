@@ -18,6 +18,17 @@ enum Exporter {
         let geoRef: GeoReference
         let visible: Bool
         let opacity: Double
+        let imageSize: Vec2?
+
+        /// Adds what the phone needs for editing points: the points, model and image size.
+        func describe(_ map: FieldMap) -> FieldMap {
+            var m = map
+            m.controlPoints = points
+            m.kind = geoRef.kind
+            m.imageWidth = imageSize?.x
+            m.imageHeight = imageSize?.y
+            return m
+        }
 
         /// Changes whenever the result would: points, model or the image file itself.
         var fingerprint: String {
@@ -38,7 +49,8 @@ enum Exporter {
         let megabytes: Double
     }
 
-    static func export(_ jobs: [Job], to folder: URL, progress: @escaping @Sendable (String) -> Void) throws -> Result {
+    static func export(_ jobs: [Job], appliedEdits: [UUID], to folder: URL,
+                       progress: @escaping @Sendable (String) -> Void) throws -> Result {
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let manifestURL = folder.appendingPathComponent(FieldPack.manifestName)
@@ -53,7 +65,7 @@ enum Exporter {
                fm.fileExists(atPath: folder.appendingPathComponent(file).path) {
                 var m = old
                 m.visible = job.visible; m.opacity = job.opacity
-                maps.append(m)
+                maps.append(job.describe(m))
                 continue
             }
             progress("Loading \(job.name) (\(i + 1) of \(jobs.count))…")
@@ -63,13 +75,13 @@ enum Exporter {
                 progress("Cutting \(name) into tiles: \(Int(share * 100))%")
             }) else { continue }
             try TilePack.write(made.tiles, to: folder.appendingPathComponent(file))
-            maps.append(FieldMap(name: job.name, tiles: file, minZoom: made.minZoom, maxZoom: made.maxZoom, fingerprint: fp,
-                                 rect: made.bounds, points: enabled, errorMetres: job.geoRef.rmsLeaveOneOut,
-                                 model: job.geoRef.kind.displayName, visible: job.visible, opacity: job.opacity))
+            maps.append(job.describe(FieldMap(name: job.name, tiles: file, minZoom: made.minZoom, maxZoom: made.maxZoom, fingerprint: fp,
+                                              rect: made.bounds, points: enabled, errorMetres: job.geoRef.rmsLeaveOneOut,
+                                              model: job.geoRef.kind.displayName, visible: job.visible, opacity: job.opacity)))
             rendered += 1
         }
         // Manifest last, so the phone never sees it pointing at files that aren't written yet.
-        try FieldPack(exported: Date(), maps: maps).encoded().write(to: manifestURL, options: .atomic)
+        try FieldPack(exported: Date(), maps: maps, appliedEdits: appliedEdits).encoded().write(to: manifestURL, options: .atomic)
 
         // Remove files of maps that are no longer exported, and single images from older exports.
         let keep = Set(maps.compactMap(\.tiles))

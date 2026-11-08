@@ -15,6 +15,6 @@ let package = Package(
         // Warping old maps onto MapKit and the export format shared by the Mac and iPhone apps.
         .target(name: "MapLayers", dependencies: ["MapMatchCore"]),
         .executableTarget(name: "OldMapMatcher", dependencies: ["MapMatchCore", "MapLayers"]),
-        .testTarget(name: "MapMatchCoreTests", dependencies: ["MapMatchCore"]),
+        .testTarget(name: "MapMatchCoreTests", dependencies: ["MapMatchCore", "MapLayers"]),
     ]
 )
