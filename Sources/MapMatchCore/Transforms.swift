@@ -37,6 +37,23 @@ public enum TransformKind: String, Codable, CaseIterable, Sendable {
     var isFlexible: Bool { self == .localCorrection || self == .thinPlateSpline }
 }
 
+/// How closely the flexible models follow the points.
+public enum Smoothing: String, Codable, CaseIterable, Sendable {
+    /// Chosen by cross-validation: best at predicting points it wasn't fitted to, over the whole map.
+    /// Tends to smooth over sharp local distortions that only a few points show.
+    case automatic
+    /// Passes within a few metres of every point, so features you've matched line up exactly. Costs a
+    /// little in overall left-out error, and a wrong point bends the map around it.
+    case followPoints
+
+    public var displayName: String {
+        switch self {
+        case .automatic: "Automatic smoothing"
+        case .followPoints: "Follow points closely"
+        }
+    }
+}
+
 /// Settings for the flexible models, normally chosen automatically by cross-validation.
 public enum ModelParameters: Sendable, Equatable {
     /// Thin-plate smoothing in normalised units: 0 = exact interpolation, large ≈ affine.
@@ -62,6 +79,13 @@ struct Normalizer: Sendable {
 
     func forward(_ p: Vec2) -> Vec2 { (p - center) * (1 / scale) }
     func inverse(_ p: Vec2) -> Vec2 { p * scale + center }
+}
+
+/// Type-erased transform, so least-squares fits of either stiff kind can be wrapped alike.
+struct AnyTransform: PlanarTransform {
+    let base: any PlanarTransform
+    init(_ base: any PlanarTransform) { self.base = base }
+    func apply(_ p: Vec2) -> Vec2 { base.apply(p) }
 }
 
 /// Wraps a transform fitted in normalised space.
@@ -224,9 +248,20 @@ public enum TransformFitter {
     /// Fits `kind` mapping src → dst. For flexible models, `parameters` nil means "choose by
     /// leave-one-out cross-validation". `srcUnitsPerMetre` converts the local-correction range
     /// (given in ground metres) into source units, e.g. 1/(metres per pixel) for image coordinates.
-    public static func fit(_ kind: TransformKind, src: [Vec2], dst: [Vec2], parameters: ModelParameters? = nil,
-                           srcUnitsPerMetre: Double = 1) -> (any PlanarTransform)? {
+    public static func fit(_ kind: TransformKind, src: [Vec2], dst: [Vec2], lines: [LineConstraint] = [],
+                           parameters: ModelParameters? = nil, srcUnitsPerMetre: Double = 1) -> (any PlanarTransform)? {
         guard src.count == dst.count, src.count >= kind.minimumPoints else { return nil }
+        if !lines.isEmpty {
+            let ns = Normalizer(src + lines.map(\.src)), nd = Normalizer(dst + lines.map(\.point))
+            let (obs, _) = DirectionalFit.observations(src: src, dst: dst, lines: lines, ns: ns, nd: nd)
+            if !kind.isFlexible {
+                return DirectionalFit.fitStiff(kind, obs).map { NormalizedTransform(src: ns, dst: nd, inner: AnyTransform($0)) }
+            }
+            let p = parameters ?? bestParameters(kind, src: src, dst: dst, lines: lines, srcUnitsPerMetre: srcUnitsPerMetre)
+            guard let p else { return nil }
+            let (kernel, diag) = radial(p, ns, srcUnitsPerMetre)
+            return DirectionalFit.fitRadial(obs, kernel: kernel, diag: diag).map { NormalizedTransform(src: ns, dst: nd, inner: $0) }
+        }
         let ns = Normalizer(src), nd = Normalizer(dst)
         let s = src.map(ns.forward), d = dst.map(nd.forward)
         switch kind {
@@ -250,16 +285,24 @@ public enum TransformFitter {
         }
     }
 
-    /// Picks the parameters that best predict each held-out point.
-    public static func bestParameters(_ kind: TransformKind, src: [Vec2], dst: [Vec2], srcUnitsPerMetre: Double = 1) -> ModelParameters? {
+    /// Thin-plate smoothing and local-correction noise ratio used by `.followPoints`.
+    static let followLambda = 0.001
+    static let followNoiseRatio = 0.05
+
+    /// Picks the parameters that best predict each held-out point. With `.followPoints` the smoothing
+    /// is fixed low and only the local-correction reach is chosen.
+    public static func bestParameters(_ kind: TransformKind, src: [Vec2], dst: [Vec2], lines: [LineConstraint] = [],
+                                      srcUnitsPerMetre: Double = 1, smoothing: Smoothing = .automatic) -> ModelParameters? {
         guard kind.isFlexible else { return nil }
+        if smoothing == .followPoints, kind == .thinPlateSpline { return .thinPlate(lambda: followLambda) }
         guard src.count >= 6 else { return defaultParameters(kind) } // too few to tell noise from real displacement
+        let ratios = smoothing == .followPoints ? [followNoiseRatio] : noiseRatioCandidates
         let candidates: [ModelParameters] = kind == .thinPlateSpline
             ? thinPlateCandidates.map { .thinPlate(lambda: $0) }
-            : rangeCandidates.flatMap { r in noiseRatioCandidates.map { .local(rangeMetres: r, noiseRatio: $0) } }
+            : rangeCandidates.flatMap { r in ratios.map { .local(rangeMetres: r, noiseRatio: $0) } }
         var best: (p: ModelParameters, error: Double)?
         for p in candidates {
-            guard let e = leaveOneOutErrors(kind, src: src, dst: dst, parameters: p, srcUnitsPerMetre: srcUnitsPerMetre),
+            guard let e = leaveOneOutErrors(kind, src: src, dst: dst, lines: lines, parameters: p, srcUnitsPerMetre: srcUnitsPerMetre),
                   e.allSatisfy(\.isFinite) else { continue }
             let rms = (e.map { $0 * $0 }.reduce(0, +) / Double(e.count)).squareRoot()
             if rms < best?.error ?? .infinity { best = (p, rms) }
@@ -270,9 +313,32 @@ public enum TransformFitter {
     /// For each point, the error (in dst units) when the model is fitted without it.
     /// This is the honest accuracy estimate: residuals of the full fit are always optimistic.
     /// Returns nil when there are too few points to leave one out.
-    public static func leaveOneOutErrors(_ kind: TransformKind, src: [Vec2], dst: [Vec2], parameters: ModelParameters? = nil,
-                                         srcUnitsPerMetre: Double = 1) -> [Double]? {
+    /// With `lines`, the result lists the points' errors and then the lines' (distance across the line).
+    public static func leaveOneOutErrors(_ kind: TransformKind, src: [Vec2], dst: [Vec2], lines: [LineConstraint] = [],
+                                         parameters: ModelParameters? = nil, srcUnitsPerMetre: Double = 1) -> [Double]? {
         guard src.count > kind.minimumPoints else { return nil }
+        if !lines.isEmpty {
+            if kind.isFlexible {
+                guard let p = parameters ?? defaultParameters(kind) else { return nil }
+                let ns = Normalizer(src + lines.map(\.src)), nd = Normalizer(dst + lines.map(\.point))
+                let (obs, groups) = DirectionalFit.observations(src: src, dst: dst, lines: lines, ns: ns, nd: nd)
+                let (kernel, diag) = radial(p, ns, srcUnitsPerMetre)
+                return DirectionalFit.leaveOneOutRadial(obs, groups: groups, kernel: kernel, diag: diag)?.map { $0.length * nd.scale }
+            }
+            let pointErrors: [Double] = src.indices.map { i in
+                var s = src, d = dst
+                s.remove(at: i); d.remove(at: i)
+                guard let t = fit(kind, src: s, dst: d, lines: lines) else { return .infinity }
+                return (t.apply(src[i]) - dst[i]).length
+            }
+            let lineErrors: [Double] = lines.indices.map { i in
+                var l = lines
+                l.remove(at: i)
+                guard let t = fit(kind, src: src, dst: dst, lines: l) else { return .infinity }
+                return abs(lines[i].offset(t.apply(lines[i].src)))
+            }
+            return pointErrors + lineErrors
+        }
         if kind.isFlexible {
             guard let p = parameters ?? defaultParameters(kind) else { return nil }
             let ns = Normalizer(src), nd = Normalizer(dst)

@@ -9,12 +9,18 @@ public struct ControlPoint: Identifiable, Hashable, Codable, Sendable {
     public var geo: LatLon
     /// Disabled points are kept but excluded from fitting (e.g. suspected misidentifications).
     public var enabled: Bool
+    /// Set for a line constraint: `image` is a spot on an old road and `geo`…`lineEnd` a stretch of the
+    /// same road today (e.g. a short remnant). Only the direction across the road is used in fitting,
+    /// since the spot's position along the road is unknown.
+    public var lineEnd: LatLon?
 
-    public init(id: UUID = UUID(), name: String = "", image: Vec2, geo: LatLon, enabled: Bool = true) {
-        self.id = id; self.name = name; self.image = image; self.geo = geo; self.enabled = enabled
+    public var isLine: Bool { lineEnd != nil }
+
+    public init(id: UUID = UUID(), name: String = "", image: Vec2, geo: LatLon, lineEnd: LatLon? = nil, enabled: Bool = true) {
+        self.id = id; self.name = name; self.image = image; self.geo = geo; self.lineEnd = lineEnd; self.enabled = enabled
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, image, geo, enabled }
+    enum CodingKeys: String, CodingKey { case id, name, image, geo, lineEnd, enabled }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
@@ -22,6 +28,7 @@ public struct ControlPoint: Identifiable, Hashable, Codable, Sendable {
         image = try c.decode(Vec2.self, forKey: .image)
         geo = try c.decode(LatLon.self, forKey: .geo)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        lineEnd = try c.decodeIfPresent(LatLon.self, forKey: .lineEnd)
     }
 }
 
@@ -39,7 +46,8 @@ public struct PointDiagnostics: Sendable {
 /// A fitted relationship between one old map image and the ground (SWEREF 99 TM).
 public struct GeoReference: Sendable {
     public let kind: TransformKind
-    /// Automatically chosen settings of the flexible models (nil for similarity/affine).
+    public let smoothing: Smoothing
+    /// Settings of the flexible models, chosen according to `smoothing` (nil for similarity/affine).
     public let parameters: ModelParameters?
     let forwardT: any PlanarTransform // image (y-up) → SWEREF
     let inverseT: any PlanarTransform // SWEREF → image (y-up)
@@ -50,30 +58,56 @@ public struct GeoReference: Sendable {
     static func imageToPlane(_ p: Vec2) -> Vec2 { Vec2(p.x, -p.y) }
     static func planeToImage(_ p: Vec2) -> Vec2 { Vec2(p.x, -p.y) }
 
-    public init?(points allPoints: [ControlPoint], kind: TransformKind) {
-        let points = allPoints.filter(\.enabled)
+    public init?(points allPoints: [ControlPoint], kind: TransformKind, smoothing: Smoothing = .automatic) {
+        let enabled = allPoints.filter(\.enabled)
+        let points = enabled.filter { !$0.isLine }
         guard points.count >= kind.minimumPoints else { return nil }
         let src = points.map { GeoReference.imageToPlane($0.image) }
         let dst = points.map { Sweref99TM.project($0.geo) }
+        var lineItems: [ControlPoint] = [], lines: [LineConstraint] = []
+        for l in enabled where l.isLine {
+            guard let c = GeoReference.constraint(l) else { continue }
+            lineItems.append(l); lines.append(c)
+        }
 
         // Approximate ground scale, so local-correction ranges can be given in metres in both directions.
         let pixelsPerMetre = Normalizer(src).scale / Normalizer(dst).scale
-        let parameters = TransformFitter.bestParameters(kind, src: src, dst: dst, srcUnitsPerMetre: pixelsPerMetre)
-        guard let f = TransformFitter.fit(kind, src: src, dst: dst, parameters: parameters, srcUnitsPerMetre: pixelsPerMetre),
-              let i = TransformFitter.fit(kind, src: dst, dst: src, parameters: parameters, srcUnitsPerMetre: 1)
+        let parameters = TransformFitter.bestParameters(kind, src: src, dst: dst, lines: lines, srcUnitsPerMetre: pixelsPerMetre,
+                                                        smoothing: smoothing)
+        guard let f = TransformFitter.fit(kind, src: src, dst: dst, lines: lines, parameters: parameters, srcUnitsPerMetre: pixelsPerMetre)
+        else { return nil }
+        // The way back has no line equations; each line contributes the spot where the forward fit puts it.
+        let lineTargets = lines.map { f.apply($0.src) }
+        guard let i = TransformFitter.fit(kind, src: dst + lineTargets, dst: src + lines.map(\.src), parameters: parameters, srcUnitsPerMetre: 1)
         else { return nil }
         self.kind = kind
+        self.smoothing = smoothing
         self.parameters = parameters
         forwardT = f
         inverseT = i
 
-        let loo = TransformFitter.leaveOneOutErrors(kind, src: src, dst: dst, parameters: parameters, srcUnitsPerMetre: pixelsPerMetre)
+        let loo = TransformFitter.leaveOneOutErrors(kind, src: src, dst: dst, lines: lines, parameters: parameters,
+                                                    srcUnitsPerMetre: pixelsPerMetre)
         var diag: [UUID: PointDiagnostics] = [:]
         for (k, p) in points.enumerated() {
             let v = f.apply(src[k]) - dst[k]
             diag[p.id] = PointDiagnostics(residual: v.length, residualVector: v, leaveOneOut: loo?[k] ?? .infinity)
         }
+        for (k, l) in lineItems.enumerated() {
+            let off = lines[k].offset(lineTargets[k])
+            diag[l.id] = PointDiagnostics(residual: abs(off), residualVector: lines[k].normal * off,
+                                          leaveOneOut: loo?[points.count + k] ?? .infinity)
+        }
         diagnostics = diag
+    }
+
+    /// The line a line item's old-map spot must land on; nil if its two ends are too close to give a direction.
+    static func constraint(_ item: ControlPoint) -> LineConstraint? {
+        guard let end = item.lineEnd else { return nil }
+        let a = Sweref99TM.project(item.geo), b = Sweref99TM.project(end)
+        let d = b - a
+        guard d.length > 0.5 else { return nil }
+        return LineConstraint(src: imageToPlane(item.image), point: a, normal: Vec2(-d.y, d.x) * (1 / d.length))
     }
 
     public func imageToSweref(_ p: Vec2) -> Vec2 { forwardT.apply(GeoReference.imageToPlane(p)) }

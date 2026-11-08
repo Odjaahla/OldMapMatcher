@@ -57,6 +57,7 @@ public struct FieldMap: Codable, Equatable, Identifiable, Sendable {
     /// overlay back into old-map pixels when you add a point.
     public var controlPoints: [ControlPoint]?
     public var kind: TransformKind?
+    public var smoothing: Smoothing?
     public var imageWidth: Double?
     public var imageHeight: Double?
 

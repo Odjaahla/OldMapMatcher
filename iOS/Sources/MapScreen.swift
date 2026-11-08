@@ -93,8 +93,10 @@ struct MapScreen: UIViewRepresentable {
         if store.showPoints, let m = store.editMap {
             for (i, p) in store.points(for: m).enumerated() {
                 let style: PointMarker.Style = store.isPending(p.id, in: m) ? .pending : (p.enabled ? .normal : .disabled)
-                wanted.append(PointMarker(key: p.id.uuidString, coordinate: p.geo.coordinate, style: style,
-                                          title: p.name.isEmpty ? "Point \(i + 1)" : p.name))
+                // Road lines sit mid-stretch.
+                let at = p.lineEnd.map { CLLocationCoordinate2D(latitude: (p.geo.lat + $0.lat) / 2, longitude: (p.geo.lon + $0.lon) / 2) }
+                wanted.append(PointMarker(key: p.id.uuidString, coordinate: at ?? p.geo.coordinate, style: style,
+                                          title: (p.name.isEmpty ? "Point \(i + 1)" : p.name) + (p.isLine ? " (road line)" : "")))
             }
         }
         if let o = store.draftOld { wanted.append(PointMarker(key: "draftOld", coordinate: o, style: .draftOld, title: "On the old map")) }
@@ -123,7 +125,7 @@ struct MapScreen: UIViewRepresentable {
         var renderers: [ObjectIdentifier: MKOverlayRenderer] = [:]
         var alphas: [ObjectIdentifier: CGFloat] = [:]
         var appliedBase: BaseMap?
-        var tiles: OSMTileOverlay?
+        var tiles: MKTileOverlay?
         var didFrameMaps = false
         /// Frame the maps on first launch only, not over a restored view.
         var hadSavedRegion = Coordinator.savedRegion != nil
@@ -142,9 +144,9 @@ struct MapScreen: UIViewRepresentable {
             case .appleStandard: map.preferredConfiguration = MKStandardMapConfiguration()
             case .appleMuted: map.preferredConfiguration = MKStandardMapConfiguration(emphasisStyle: .muted)
             case .appleSatellite: map.preferredConfiguration = MKHybridMapConfiguration()
-            case .openStreetMap:
+            case .openStreetMap, .terrain:
                 map.preferredConfiguration = MKStandardMapConfiguration()
-                let t = OSMTileOverlay()
+                let t: MKTileOverlay = base == .terrain ? HillshadeTileOverlay() : OSMTileOverlay()
                 tiles = t
                 map.addOverlay(t, level: .aboveLabels)
                 // Keep the old maps above the tiles.

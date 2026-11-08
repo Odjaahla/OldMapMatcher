@@ -6,7 +6,7 @@ import MapLayers
 import MapMatchCore
 
 enum BaseMap: String, CaseIterable, Identifiable {
-    case appleStandard, appleMuted, appleSatellite, openStreetMap
+    case appleStandard, appleMuted, appleSatellite, openStreetMap, terrain
     var id: String { rawValue }
     var displayName: String {
         switch self {
@@ -14,6 +14,7 @@ enum BaseMap: String, CaseIterable, Identifiable {
         case .appleMuted: "Apple Maps (muted)"
         case .appleSatellite: "Satellite"
         case .openStreetMap: "OpenStreetMap"
+        case .terrain: "Terrain (LiDAR)"
         }
     }
 }

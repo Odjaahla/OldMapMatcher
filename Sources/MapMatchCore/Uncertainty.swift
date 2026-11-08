@@ -18,7 +18,7 @@ public struct UncertaintyField: Sendable {
 
     /// From a map's control points (disabled ones are ignored). Needs at least 6 enabled points.
     public init?(points allPoints: [ControlPoint]) {
-        let points = allPoints.filter(\.enabled)
+        let points = allPoints.filter { $0.enabled && !$0.isLine } // lines don't pin a position
         let image = points.map { GeoReference.imageToPlane($0.image) }
         let ground = points.map { Sweref99TM.project($0.geo) }
         guard points.count >= 6 else { return nil }

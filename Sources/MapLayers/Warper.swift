@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 import ImageIO
 import MapKit
@@ -279,7 +280,11 @@ public enum Warper {
 
 /// OpenStreetMap tiles with an identifying User-Agent, as the OSM tile policy asks.
 public final class OSMTileOverlay: MKTileOverlay {
-    public init() {
+    /// Inverted with the hues turned back, so water stays blue and parks green on a dark ground.
+    public let dark: Bool
+
+    public init(dark: Bool = false) {
+        self.dark = dark
         super.init(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
         canReplaceMapContent = true
         maximumZ = 19
@@ -288,7 +293,21 @@ public final class OSMTileOverlay: MKTileOverlay {
     override public func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
         var req = URLRequest(url: url(forTilePath: path))
         req.setValue("OldMapMatcher/0.1 (personal historical map research)", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { data, _, error in result(data, error) }.resume()
+        let dark = dark
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            result(dark ? data.flatMap(Self.darken) ?? data : data, error)
+        }.resume()
+    }
+
+    private static let context = CIContext()
+
+    static func darken(_ png: Data) -> Data? {
+        guard let image = CIImage(data: png) else { return nil }
+        let out = image
+            .applyingFilter("CIColorInvert")
+            .applyingFilter("CIHueAdjust", parameters: [kCIInputAngleKey: Double.pi])
+            .applyingFilter("CIColorControls", parameters: [kCIInputBrightnessKey: -0.05, kCIInputContrastKey: 0.9])
+        return context.pngRepresentation(of: out, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
     }
 }
 

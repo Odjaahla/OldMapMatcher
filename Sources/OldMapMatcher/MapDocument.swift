@@ -9,6 +9,8 @@ import MapMatchCore
 struct ControlPointFile: Codable {
     var image: String
     var kind: TransformKind
+    /// Missing in files from before the setting existed: automatic.
+    var smoothing: Smoothing?
     var points: [ControlPoint]
 }
 
@@ -23,6 +25,9 @@ final class MapDocument: ObservableObject, Identifiable {
 
     @Published var points: [ControlPoint] = [] { didSet { if oldValue != points { changed() } } }
     @Published var kind: TransformKind = .similarity { didSet { if oldValue != kind { changed() } } }
+    @Published var smoothing: Smoothing = .automatic { didSet { if oldValue != smoothing { changed() } } }
+    /// Left-out error (RMS, metres) of the current model with each smoothing setting; empty for stiff models.
+    @Published private(set) var smoothingComparison: [Smoothing: Double] = [:]
     @Published private(set) var geoRef: GeoReference?
     /// True while a refit is running in the background.
     @Published private(set) var fitting = false
@@ -64,6 +69,7 @@ final class MapDocument: ObservableObject, Identifiable {
             do {
                 let file = try JSONDecoder().decode(ControlPointFile.self, from: Data(contentsOf: gcpURL))
                 kind = file.kind
+                smoothing = file.smoothing ?? .automatic
                 points = file.points
             } catch {
                 loadError = "Could not read \(gcpURL.lastPathComponent): \(error.localizedDescription). It will not be overwritten until you add a point."
@@ -97,22 +103,29 @@ final class MapDocument: ObservableObject, Identifiable {
     private func refit() {
         fitTask?.cancel()
         fitting = true
-        let points = points, kind = kind
+        let points = points, kind = kind, smoothing = smoothing
         fitTask = Task {
             let size = imageSize
-            let (g, comparison, shading) = await Task.detached(priority: .userInitiated) {
-                () -> (GeoReference?, [TransformKind: Double], UncertaintyOverlay?) in
+            let (g, comparison, bySmoothing, shading) = await Task.detached(priority: .userInitiated) {
+                () -> (GeoReference?, [TransformKind: Double], [Smoothing: Double], UncertaintyOverlay?) in
                 var fits: [TransformKind: GeoReference] = [:]
-                for k in TransformKind.allCases { fits[k] = GeoReference(points: points, kind: k) }
+                for k in TransformKind.allCases { fits[k] = GeoReference(points: points, kind: k, smoothing: smoothing) }
                 let g = fits[kind] ?? (kind != .similarity ? fits[.similarity] : nil)
+                var bySmoothing: [Smoothing: Double] = [:]
+                if let g, g.parameters != nil {
+                    for s in Smoothing.allCases {
+                        bySmoothing[s] = s == smoothing ? g.rmsLeaveOneOut : GeoReference(points: points, kind: kind, smoothing: s)?.rmsLeaveOneOut
+                    }
+                }
                 let shading = g.flatMap { g in
                     UncertaintyField(points: points).flatMap { f in size.flatMap { UncertaintyOverlay(field: f, geoRef: g, imageSize: $0) } }
                 }
-                return (g, fits.compactMapValues(\.rmsLeaveOneOut), shading)
+                return (g, fits.compactMapValues(\.rmsLeaveOneOut), bySmoothing, shading)
             }.value
             guard !Task.isCancelled else { return }
             geoRef = g
             modelComparison = comparison
+            smoothingComparison = bySmoothing
             uncertaintyOverlay = shading
             fitting = false
             updateOverlay()
@@ -120,7 +133,7 @@ final class MapDocument: ObservableObject, Identifiable {
     }
 
     private func save() {
-        let file = ControlPointFile(image: url.lastPathComponent, kind: kind, points: points)
+        let file = ControlPointFile(image: url.lastPathComponent, kind: kind, smoothing: smoothing, points: points)
         do {
             try FileManager.default.createDirectory(at: gcpURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let enc = JSONEncoder()

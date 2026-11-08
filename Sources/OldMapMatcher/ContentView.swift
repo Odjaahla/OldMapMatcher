@@ -156,6 +156,9 @@ struct ControlBar: View {
         }
         .pickerStyle(.menu)
         .frame(width: 190)
+        Toggle("Dark", isOn: $state.darkMap)
+            .fixedSize()
+            .help("Dark modern map, so the old maps are easier to read on top of it")
     }
 
     @ViewBuilder private var options: some View {
@@ -169,6 +172,12 @@ struct ControlBar: View {
         if state.showUncertainty, state.active?.uncertaintyOverlay != nil { UncertaintyLegend().fixedSize() }
         switch state.mode {
         case .match:
+            Picker("Add", selection: $state.addKind) {
+                ForEach(AppState.AddKind.allCases) { Text($0.displayName).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .help("Point: a feature on both maps. Road line: a spot on an old road and a stretch of the same road today (e.g. a remnant); only fixes the direction across the road.")
             Toggle("Overlay", isOn: $state.showOverlay)
                 .fixedSize()
                 .help("Draw the warped old map on top of the modern map")
@@ -231,6 +240,13 @@ struct ModelPicker: View {
         .pickerStyle(.menu)
         .frame(width: 190)
         .help("Similarity: rotate/scale only. Affine: adds uneven stretch. Thin-plate spline: also smooth local bending.")
+        Picker("Fit", selection: $doc.smoothing) {
+            ForEach(Smoothing.allCases, id: \.self) { Text($0.displayName).tag($0) }
+        }
+        .pickerStyle(.menu)
+        .frame(width: 190)
+        .disabled(!(doc.kind == .thinPlateSpline || doc.kind == .localCorrection))
+        .help("Automatic: best at predicting unseen points over the whole map, but smooths over sharp local distortions. Follow points closely: the overlay passes within a few metres of every point; a wrong point bends the map around it.")
     }
 }
 
@@ -240,8 +256,16 @@ struct PointsPanel: View {
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
             Table(state.points, selection: $state.selection) {
-                TableColumn("#") { p in Text("\(state.number(of: p.id) ?? 0)").monospacedDigit() }
-                    .width(28)
+                TableColumn("#") { p in
+                    HStack(spacing: 2) {
+                        Text("\(state.number(of: p.id) ?? 0)").monospacedDigit()
+                        if p.isLine {
+                            Image(systemName: "road.lanes").foregroundStyle(.teal)
+                                .help("Road line: residual and left-out error are across the road")
+                        }
+                    }
+                }
+                .width(44)
                 TableColumn("Name") { p in
                     TextField("feature", text: binding(p.id, \.name, default: ""))
                         .textFieldStyle(.plain)
@@ -318,13 +342,14 @@ struct StatsView: View {
                         GridRow { Text("Scale at centre"); Text(String(format: "%.2f m/px", g.metresPerPixel(at: c))) }
                         GridRow { Text("Map up vs true north"); Text(String(format: "%+.1f°", g.northDeviationDegrees(at: c))) }
                     }
+                    let auto = g.smoothing == .automatic ? " (auto)" : ""
                     switch g.parameters {
                     case .thinPlate(let l)?:
-                        GridRow { Text("Smoothing (auto)"); Text(String(format: "%g", l)) }
+                        GridRow { Text("Smoothing" + auto); Text(String(format: "%g", l)) }
                     case .local(let range, let ratio)?:
                         GridRow { Text("Correction reach (auto)"); Text(String(format: "%.0f m", range)) }
                             .help("How far from each point its local correction extends")
-                        GridRow { Text("Noise share (auto)"); Text(String(format: "%.0f%%", 100 * ratio * ratio / (1 + ratio * ratio))) }
+                        GridRow { Text("Noise share" + auto); Text(String(format: "%.0f%%", 100 * ratio * ratio / (1 + ratio * ratio))) }
                             .help("Share of point-to-point scatter treated as clicking/drawing noise rather than real local displacement")
                     case nil:
                         EmptyView()
@@ -332,6 +357,21 @@ struct StatsView: View {
                 }
                 .font(.callout)
                 .monospacedDigit()
+                if doc.smoothingComparison.count == 2 {
+                    Text("Left-out error by fit").font(.subheadline).padding(.top, 4)
+                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                        ForEach(Smoothing.allCases, id: \.self) { s in
+                            GridRow {
+                                Text(s.displayName)
+                                Text(doc.smoothingComparison[s].map { String(format: "%.1f m", $0) } ?? "–")
+                                if s == doc.smoothing { Image(systemName: "checkmark").foregroundStyle(.green) }
+                            }
+                        }
+                    }
+                    .font(.callout)
+                    .monospacedDigit()
+                    .help("Following the points closely usually costs a little here, but puts the overlay right on the features you've matched.")
+                }
                 if !doc.modelComparison.isEmpty {
                     Text("Left-out error by model").font(.subheadline).padding(.top, 4)
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
@@ -381,6 +421,9 @@ struct StatsView: View {
             return doc.geoRef == nil
                 ? "Add points in Match mode (⌘1) before this map can be shown as a layer."
                 : "Option-drag from a feature on the \(doc.name) layer to where it is today to add a point."
+        }
+        if state.addKind == .line {
+            return state.nextStep + ". Only the direction across the road is used, so the spot along the old road doesn't matter."
         }
         if state.pendingImage != nil { return "Now click the same feature on the modern map." }
         if state.pendingGeo != nil { return "Now click the same feature on the old map." }

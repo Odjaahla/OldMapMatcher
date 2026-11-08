@@ -6,13 +6,14 @@ import MapMatchCore
 import SwiftUI
 
 enum BaseLayer: String, CaseIterable, Identifiable {
-    case appleStandard, appleSatellite, openStreetMap
+    case appleStandard, appleSatellite, openStreetMap, terrain
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .appleStandard: "Apple Maps"
         case .appleSatellite: "Satellite"
         case .openStreetMap: "OpenStreetMap"
+        case .terrain: "Terrain (LiDAR)"
         }
     }
 }
@@ -68,10 +69,26 @@ final class AppState: ObservableObject {
 
     @Published private(set) var pendingImage: Vec2?
     @Published private(set) var pendingGeo: LatLon?
+    /// Road-line mode: the second end of the stretch on the modern map.
+    @Published private(set) var pendingLineEnd: LatLon?
+
+    enum AddKind: String, CaseIterable, Identifiable {
+        /// A feature on both maps.
+        case point
+        /// A spot on an old road matched to a stretch of the same road today; fixes only the direction across it.
+        case line
+        var id: String { rawValue }
+        var displayName: String { self == .point ? "Point" : "Road line" }
+    }
+    @Published var addKind = AddKind.point { didSet { if addKind != oldValue { cancelPending() } } }
     @Published var selection: Set<ControlPoint.ID> = []
 
     @Published var baseLayer = BaseLayer(rawValue: UserDefaults.standard.string(forKey: "baseLayer") ?? "") ?? .appleStandard {
         didSet { defaults.set(baseLayer.rawValue, forKey: "baseLayer") }
+    }
+    /// Dark modern map: the old maps' paper colours stand out better against it.
+    @Published var darkMap = UserDefaults.standard.object(forKey: "darkMap") as? Bool ?? true {
+        didSet { defaults.set(darkMap, forKey: "darkMap") }
     }
     @Published var showResiduals = UserDefaults.standard.object(forKey: "showResiduals") as? Bool ?? true {
         didSet { defaults.set(showResiduals, forKey: "showResiduals") }
@@ -307,7 +324,7 @@ final class AppState: ObservableObject {
     func activate(_ doc: MapDocument?) {
         guard doc !== active else { return }
         active = doc
-        pendingImage = nil; pendingGeo = nil; selection = []
+        pendingImage = nil; pendingGeo = nil; pendingLineEnd = nil; selection = []
         cursor.geo.send(nil); cursor.image.send(nil)
         if let doc { defaults.set(doc.url.lastPathComponent, forKey: "lastMap") }
         updateDocumentNeeds()
@@ -364,31 +381,50 @@ final class AppState: ObservableObject {
     }
 
     var predictedImage: Vec2? {
-        guard let g = pendingGeo, pendingImage == nil else { return nil }
+        guard let g = pendingGeo, pendingImage == nil, addKind == .point else { return nil }
         return geoRef?.geoToImage(g)
+    }
+
+    /// What the next click should be, for the hint in the toolbar.
+    var nextStep: String {
+        switch addKind {
+        case .point:
+            return pendingImage != nil ? "Click the same feature on the modern map" :
+                pendingGeo != nil ? "Click the same feature on the old map" : "Click a feature on either map"
+        case .line:
+            let modern = pendingGeo == nil ? "click one end of the road's stretch today" : "click the other end of the stretch"
+            return pendingImage == nil ? "Click the old road on the old map, and " + modern : "Now " + modern
+        }
     }
 
     func placeOnImage(_ p: Vec2) {
         pendingImage = p
-        if pendingGeo != nil { commitPending() } else if let g = predictedGeo { geoFocus = FocusRequest(value: g) }
+        if isComplete { commitPending() } else if pendingGeo == nil, let g = predictedGeo { geoFocus = FocusRequest(value: g) }
     }
 
     func placeOnMap(_ g: LatLon) {
         guard mode == .match else { return }
-        pendingGeo = g
-        if pendingImage != nil { commitPending() } else if let p = predictedImage { imageFocus = FocusRequest(value: p) }
+        if addKind == .line, pendingGeo != nil { pendingLineEnd = g } else { pendingGeo = g }
+        if isComplete { commitPending() } else if let p = predictedImage { imageFocus = FocusRequest(value: p) }
     }
 
-    /// Accepts the model's prediction for the missing side of a pending pair.
+    private var isComplete: Bool {
+        pendingImage != nil && pendingGeo != nil && (addKind == .point || pendingLineEnd != nil)
+    }
+
+    /// Accepts the model's prediction for the missing side of a pending pair (points only).
     func acceptPrediction() {
+        guard addKind == .point else { return }
         if let g = predictedGeo { pendingGeo = g } else if let p = predictedImage { pendingImage = p }
         commitPending()
     }
 
     private func commitPending() {
         guard let p = pendingImage, let g = pendingGeo else { return }
-        pendingImage = nil; pendingGeo = nil
-        addPoint(ControlPoint(image: p, geo: g))
+        let end = addKind == .line ? pendingLineEnd : nil
+        if addKind == .line, end == nil { return }
+        pendingImage = nil; pendingGeo = nil; pendingLineEnd = nil
+        addPoint(ControlPoint(image: p, geo: g, lineEnd: end))
     }
 
     private func addPoint(_ point: ControlPoint) {
@@ -396,7 +432,7 @@ final class AppState: ObservableObject {
         selection = [point.id]
     }
 
-    func cancelPending() { pendingImage = nil; pendingGeo = nil }
+    func cancelPending() { pendingImage = nil; pendingGeo = nil; pendingLineEnd = nil }
 
     /// Explore mode: the feature drawn at `from` on the active map's overlay really lies at `to`.
     /// Returns false if `from` isn't on the old map.
@@ -417,6 +453,20 @@ final class AppState: ObservableObject {
     func moveGeo(of id: UUID, to g: LatLon) {
         guard let doc = active, let i = doc.points.firstIndex(where: { $0.id == id }) else { return }
         doc.points[i].geo = g
+    }
+
+    /// Moves a road line's stretch as a whole so its middle lands on `centre`.
+    func moveLine(of id: UUID, centreTo centre: LatLon) {
+        guard let doc = active, let i = doc.points.firstIndex(where: { $0.id == id }), let end = doc.points[i].lineEnd else { return }
+        let a = Sweref99TM.project(doc.points[i].geo), b = Sweref99TM.project(end)
+        let shift = Sweref99TM.project(centre) - (a + b) * 0.5
+        doc.points[i].geo = Sweref99TM.unproject(a + shift)
+        doc.points[i].lineEnd = Sweref99TM.unproject(b + shift)
+    }
+
+    func moveLineEnd(of id: UUID, to g: LatLon) {
+        guard let doc = active, let i = doc.points.firstIndex(where: { $0.id == id }), doc.points[i].isLine else { return }
+        doc.points[i].lineEnd = g
     }
 
     func select(_ id: UUID) { selection = [id] }

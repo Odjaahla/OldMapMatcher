@@ -14,7 +14,22 @@ final class ControlPointAnnotation: MKPointAnnotation {
     var number = 0
     var selected = false
     var enabled = true
+    /// A road line: the marker sits mid-stretch and dragging it moves the whole stretch.
+    var isLine = false
     init(id: UUID) { pointID = id }
+}
+
+/// Draggable handle at either end of a road line's stretch.
+final class LineEndAnnotation: MKPointAnnotation {
+    let pointID: UUID
+    let isEnd: Bool
+    init(id: UUID, isEnd: Bool) { pointID = id; self.isEnd = isEnd }
+}
+
+/// The modern stretch of a road line.
+final class ControlLineOverlay: MKPolyline {
+    var enabled = true
+    var pending = false
 }
 
 final class PendingAnnotation: MKPointAnnotation {}
@@ -123,8 +138,11 @@ struct ModernMapView: NSViewRepresentable {
         var state: AppState
         weak var mapView: MKMapView?
         var appliedBase: BaseLayer?
-        var tileOverlay: OSMTileOverlay?
+        var appliedDark: Bool?
+        var tileOverlay: MKTileOverlay?
         var annotations: [UUID: ControlPointAnnotation] = [:]
+        var lineEnds: [UUID: (LineEndAnnotation, LineEndAnnotation)] = [:]
+        var lineKey: [Double] = []
         let pending = PendingAnnotation()
         let predicted = PredictedAnnotation()
         let cursor = CursorAnnotation()
@@ -184,6 +202,13 @@ struct ModernMapView: NSViewRepresentable {
                 v.displayPriority = .required
                 v.animatesWhenAdded = false
                 return v
+            case let a as LineEndAnnotation:
+                let v = mapView.dequeueReusableAnnotationView(withIdentifier: "lineEnd") ?? MKAnnotationView(annotation: a, reuseIdentifier: "lineEnd")
+                v.annotation = a
+                v.image = Self.lineHandle
+                v.isDraggable = true
+                v.displayPriority = .required
+                return v
             case is PendingAnnotation:
                 let v = MKMarkerAnnotationView(annotation: annotation, reuseIdentifier: nil)
                 v.markerTintColor = .systemOrange
@@ -203,7 +228,14 @@ struct ModernMapView: NSViewRepresentable {
 
         func configure(_ v: MKMarkerAnnotationView, for a: ControlPointAnnotation) {
             v.glyphText = "\(a.number)"
-            v.markerTintColor = !a.enabled ? .systemGray : (a.selected ? .systemGreen : .systemBlue)
+            v.markerTintColor = !a.enabled ? .systemGray : (a.selected ? .systemGreen : (a.isLine ? .systemTeal : .systemBlue))
+        }
+
+        static let lineHandle = NSImage(size: NSSize(width: 14, height: 14), flipped: false) { r in
+            let p = NSBezierPath(ovalIn: r.insetBy(dx: 2, dy: 2))
+            NSColor.white.setFill(); p.fill()
+            NSColor.systemTeal.setStroke(); p.lineWidth = 2.5; p.stroke()
+            return true
         }
 
         private func crosshairView(_ annotation: MKAnnotation, color: NSColor, size: CGFloat, dashed: Bool) -> MKAnnotationView {
@@ -239,7 +271,17 @@ struct ModernMapView: NSViewRepresentable {
             view.dragState = .none
             if newState == .ending, let a = view.annotation as? ControlPointAnnotation {
                 let c = a.coordinate
-                Task { @MainActor in self.state.moveGeo(of: a.pointID, to: LatLon(c)) }
+                if a.isLine {
+                    Task { @MainActor in self.state.moveLine(of: a.pointID, centreTo: LatLon(c)) }
+                } else {
+                    Task { @MainActor in self.state.moveGeo(of: a.pointID, to: LatLon(c)) }
+                }
+            }
+            if newState == .ending, let a = view.annotation as? LineEndAnnotation {
+                let c = a.coordinate
+                Task { @MainActor in
+                    if a.isEnd { self.state.moveLineEnd(of: a.pointID, to: LatLon(c)) } else { self.state.moveGeo(of: a.pointID, to: LatLon(c)) }
+                }
             }
         }
 
@@ -253,6 +295,12 @@ struct ModernMapView: NSViewRepresentable {
                 let r = LiveWarpRenderer(overlay: w)
                 r.alpha = CGFloat(opacities[ObjectIdentifier(w)] ?? 0.7)
                 renderers[ObjectIdentifier(w)] = r
+                return r
+            case let l as ControlLineOverlay:
+                let r = MKPolylineRenderer(polyline: l)
+                r.strokeColor = l.pending ? .systemOrange : (l.enabled ? .systemTeal : .systemGray)
+                r.lineWidth = 4
+                r.lineCap = .round
                 return r
             case let l as ResidualLine:
                 let r = MKPolylineRenderer(polyline: l)
@@ -332,15 +380,22 @@ struct ModernMapView: NSViewRepresentable {
     }
 
     private func applyBaseLayer(_ map: MKMapView, _ c: Coordinator) {
-        guard c.appliedBase != state.baseLayer else { return }
+        guard c.appliedBase != state.baseLayer || c.appliedDark != state.darkMap else { return }
         c.appliedBase = state.baseLayer
+        c.appliedDark = state.darkMap
+        map.appearance = NSAppearance(named: state.darkMap ? .darkAqua : .aqua)
         if let t = c.tileOverlay { map.removeOverlay(t); c.tileOverlay = nil }
         switch state.baseLayer {
         case .appleStandard: map.mapType = .standard
         case .appleSatellite: map.mapType = .hybrid
         case .openStreetMap:
             map.mapType = .standard
-            let t = OSMTileOverlay()
+            let t = OSMTileOverlay(dark: state.darkMap)
+            map.insertOverlay(t, at: 0, level: .aboveLabels)
+            c.tileOverlay = t
+        case .terrain:
+            map.mapType = .standard
+            let t = HillshadeTileOverlay(dark: state.darkMap)
             map.insertOverlay(t, at: 0, level: .aboveLabels)
             c.tileOverlay = t
         }
@@ -351,24 +406,67 @@ struct ModernMapView: NSViewRepresentable {
         var seen = Set<UUID>()
         for (i, p) in points.enumerated() {
             seen.insert(p.id)
+            let where_ = Self.markerPosition(p)
             let a = c.annotations[p.id] ?? {
                 let a = ControlPointAnnotation(id: p.id)
-                a.coordinate = p.geo.coordinate
+                a.coordinate = where_
                 c.annotations[p.id] = a
                 map.addAnnotation(a)
                 return a
             }()
             let selected = state.selection.contains(p.id)
-            if a.coordinate.latitude != p.geo.lat || a.coordinate.longitude != p.geo.lon { a.coordinate = p.geo.coordinate }
-            if a.number != i + 1 || a.selected != selected || a.enabled != p.enabled {
-                a.number = i + 1; a.selected = selected; a.enabled = p.enabled
+            if a.coordinate.latitude != where_.latitude || a.coordinate.longitude != where_.longitude { a.coordinate = where_ }
+            if a.number != i + 1 || a.selected != selected || a.enabled != p.enabled || a.isLine != p.isLine {
+                a.number = i + 1; a.selected = selected; a.enabled = p.enabled; a.isLine = p.isLine
                 if let v = map.view(for: a) as? MKMarkerAnnotationView { c.configure(v, for: a) }
+            }
+            if let end = p.lineEnd {
+                let (h0, h1) = c.lineEnds[p.id] ?? {
+                    let h = (LineEndAnnotation(id: p.id, isEnd: false), LineEndAnnotation(id: p.id, isEnd: true))
+                    c.lineEnds[p.id] = h
+                    map.addAnnotations([h.0, h.1])
+                    return h
+                }()
+                if h0.coordinate.latitude != p.geo.lat || h0.coordinate.longitude != p.geo.lon { h0.coordinate = p.geo.coordinate }
+                if h1.coordinate.latitude != end.lat || h1.coordinate.longitude != end.lon { h1.coordinate = end.coordinate }
             }
         }
         for (id, a) in c.annotations where !seen.contains(id) {
             map.removeAnnotation(a)
             c.annotations[id] = nil
         }
+        for (id, h) in c.lineEnds where !points.contains(where: { $0.id == id && $0.isLine }) {
+            map.removeAnnotations([h.0, h.1])
+            c.lineEnds[id] = nil
+        }
+
+        // The stretches themselves, plus the one being added.
+        var stretches: [ControlLineOverlay] = points.compactMap { p in
+            guard let end = p.lineEnd else { return nil }
+            let l = ControlLineOverlay(coordinates: [p.geo.coordinate, end.coordinate], count: 2)
+            l.enabled = p.enabled
+            return l
+        }
+        if let a = state.pendingGeo, let b = state.pendingLineEnd {
+            let l = ControlLineOverlay(coordinates: [a.coordinate, b.coordinate], count: 2)
+            l.pending = true
+            stretches.append(l)
+        }
+        let key = stretches.flatMap { l -> [Double] in
+            var cs = [CLLocationCoordinate2D](repeating: .init(), count: 2)
+            l.getCoordinates(&cs, range: NSRange(location: 0, length: 2))
+            return cs.flatMap { [$0.latitude, $0.longitude] } + [l.enabled ? 1 : 0, l.pending ? 1 : 0]
+        }
+        guard key != c.lineKey else { return }
+        c.lineKey = key
+        map.removeOverlays(map.overlays.filter { $0 is ControlLineOverlay })
+        map.addOverlays(stretches, level: .aboveLabels)
+    }
+
+    /// Points sit where they were clicked; road lines' markers sit mid-stretch.
+    static func markerPosition(_ p: ControlPoint) -> CLLocationCoordinate2D {
+        guard let end = p.lineEnd else { return p.geo.coordinate }
+        return Sweref99TM.unproject((Sweref99TM.project(p.geo) + Sweref99TM.project(end)) * 0.5).coordinate
     }
 
     private func syncSingle(_ map: MKMapView, _ a: MKPointAnnotation, at g: LatLon?) {
@@ -388,9 +486,16 @@ struct ModernMapView: NSViewRepresentable {
         if state.showResiduals, let g = state.geoRef {
             for p in state.points where p.enabled {
                 guard let d = g.diagnostics[p.id] else { continue }
-                let from = Sweref99TM.project(p.geo)
-                let to = Sweref99TM.unproject(from + d.residualVector)
-                lines.append(ResidualLine(coordinates: [p.geo.coordinate, to.coordinate], count: 2))
+                if p.isLine {
+                    // From the line to where the model puts the old road: straight across the road.
+                    let tip = g.imageToSweref(p.image)
+                    let foot = tip - d.residualVector
+                    lines.append(ResidualLine(coordinates: [Sweref99TM.unproject(foot).coordinate, Sweref99TM.unproject(tip).coordinate], count: 2))
+                } else {
+                    let from = Sweref99TM.project(p.geo)
+                    let to = Sweref99TM.unproject(from + d.residualVector)
+                    lines.append(ResidualLine(coordinates: [p.geo.coordinate, to.coordinate], count: 2))
+                }
             }
         }
         let key = lines.flatMap { l -> [Double] in

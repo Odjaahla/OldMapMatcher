@@ -98,7 +98,10 @@ extension LayerStore {
             let fitted = await Task.detached(priority: .userInitiated) { () -> [String: GeoReference] in
                 var out: [String: GeoReference] = [:]
                 for m in maps {
-                    if let pts = m.controlPoints, let g = GeoReference(points: pts, kind: m.kind ?? .similarity) { out[m.name] = g }
+                    if let pts = m.controlPoints,
+                       let g = GeoReference(points: pts, kind: m.kind ?? .similarity, smoothing: m.smoothing ?? .automatic) {
+                        out[m.name] = g
+                    }
                 }
                 return out
             }.value

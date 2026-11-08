@@ -25,6 +25,7 @@ enum Exporter {
             var m = map
             m.controlPoints = points
             m.kind = geoRef.kind
+            m.smoothing = geoRef.smoothing
             m.imageWidth = imageSize?.x
             m.imageHeight = imageSize?.y
             return m
@@ -36,7 +37,7 @@ enum Exporter {
             let enc = JSONEncoder()
             enc.outputFormatting = .sortedKeys
             h.update(data: (try? enc.encode(points)) ?? Data())
-            h.update(data: Data(geoRef.kind.rawValue.utf8))
+            h.update(data: Data((geoRef.kind.rawValue + geoRef.smoothing.rawValue).utf8))
             let attrs = try? FileManager.default.attributesOfItem(atPath: imageURL.path)
             h.update(data: Data("\(attrs?[.size] ?? 0)|\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)".utf8))
             return h.finalize().map { String(format: "%02x", $0) }.joined()

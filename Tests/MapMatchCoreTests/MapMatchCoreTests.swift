@@ -281,3 +281,121 @@ struct SplitMix {
         #expect(try PhoneEdits.decode(e.encoded()).edits.first?.point == a)
     }
 }
+
+@Suite struct SmoothingTests {
+    @Test(arguments: [TransformKind.thinPlateSpline, .localCorrection])
+    func followPointsPassesCloserToThePoints(_ kind: TransformKind) throws {
+        let (src, dst) = LocalCorrectionTests().patchyPairs(noise: 3, patchOffset: 25)
+        let points = zip(src, dst).map { s, d in ControlPoint(image: Vec2(s.x, -s.y), geo: Sweref99TM.unproject(d)) }
+        let auto = try #require(GeoReference(points: points, kind: kind, smoothing: .automatic))
+        let follow = try #require(GeoReference(points: points, kind: kind, smoothing: .followPoints))
+        #expect(follow.rmsResidual < 0.5 * auto.rmsResidual)
+        #expect(follow.rmsResidual < 2) // metres, against 3 m clicking noise
+        #expect(follow.smoothing == .followPoints)
+    }
+
+    @Test func stiffModelsIgnoreIt() throws {
+        let (src, dst) = LocalCorrectionTests().patchyPairs(noise: 3, patchOffset: 25, count: 20)
+        let points = zip(src, dst).map { s, d in ControlPoint(image: Vec2(s.x, -s.y), geo: Sweref99TM.unproject(d)) }
+        let a = try #require(GeoReference(points: points, kind: .affine, smoothing: .automatic))
+        let b = try #require(GeoReference(points: points, kind: .affine, smoothing: .followPoints))
+        #expect(a.rmsResidual == b.rmsResidual)
+    }
+}
+
+@Suite struct LineConstraintTests {
+    let local = LocalCorrectionTests()
+
+    /// Lines along "roads" (random directions) through spots whose true positions are known.
+    func lines(_ src: [Vec2], _ dst: [Vec2], seed: UInt64) -> [LineConstraint] {
+        var rng = SplitMix(seed: seed)
+        return zip(src, dst).map { s, d in
+            let a = rng.uniform(0, .pi)
+            let dir = Vec2(cos(a), sin(a))
+            // The line passes through the true spot, anchored some way along it.
+            return LineConstraint(src: s, point: d + dir * rng.uniform(-40, 40), normal: Vec2(-dir.y, dir.x))
+        }
+    }
+
+    @Test(arguments: [ModelParameters.thinPlate(lambda: 0.05), .local(rangeMetres: 500, noiseRatio: 0.3)])
+    func pointsOnlyMatchesSeparateFit(_ p: ModelParameters) throws {
+        let (src, dst) = local.patchyPairs(noise: 4, patchOffset: 20)
+        let ns = Normalizer(src), nd = Normalizer(dst)
+        let (kernel, diag): (RadialKernel, Double) = switch p {
+        case .thinPlate(let l): (.thinPlate, l)
+        case .local(let r, let q): (.matern32(range: r * 0.5 / ns.scale), q * q)
+        }
+        let s = src.map(ns.forward), d = dst.map(nd.forward)
+        let separate = try #require(RadialBasisTransform.fit(s, d, kernel: kernel, diag: diag))
+        let (obs, groups) = DirectionalFit.observations(src: src, dst: dst, lines: [], ns: ns, nd: nd)
+        let joint = try #require(DirectionalFit.fitRadial(obs, kernel: kernel, diag: diag))
+        for q in s.prefix(20) { #expect((separate.apply(q) - joint.apply(q)).length < 1e-9) }
+        let a = try #require(RadialBasisTransform.leaveOneOutResiduals(s, d, kernel: kernel, diag: diag))
+        let b = try #require(DirectionalFit.leaveOneOutRadial(obs, groups: groups, kernel: kernel, diag: diag))
+        for (x, y) in zip(a, b) { #expect(abs(x.length - y.length) < 1e-9) }
+    }
+
+    @Test(arguments: [ModelParameters.thinPlate(lambda: 0.05), .local(rangeMetres: 500, noiseRatio: 0.3)])
+    func closedFormLeaveOneOutMatchesRefittingWithLines(_ p: ModelParameters) throws {
+        let (src, dst) = local.patchyPairs(noise: 4, patchOffset: 20, count: 60)
+        let pts = Array(0..<40), ln = Array(40..<60)
+        let l = lines(ln.map { src[$0] }, ln.map { dst[$0] }, seed: 3)
+        let s = pts.map { src[$0] }, d = pts.map { dst[$0] }
+        let kind: TransformKind = if case .thinPlate = p { .thinPlateSpline } else { .localCorrection }
+        let fast = try #require(TransformFitter.leaveOneOutErrors(kind, src: s, dst: d, lines: l, parameters: p, srcUnitsPerMetre: 0.5))
+        // Brute force with the same normalisation, which the closed form keeps fixed.
+        let ns = Normalizer(s + l.map(\.src)), nd = Normalizer(d + l.map(\.point))
+        let (kernel, diag): (RadialKernel, Double) = switch p {
+        case .thinPlate(let x): (.thinPlate, x)
+        case .local(let r, let q): (.matern32(range: r * 0.5 / ns.scale), q * q)
+        }
+        let (obs, groups) = DirectionalFit.observations(src: s, dst: d, lines: l, ns: ns, nd: nd)
+        for (g, group) in groups.enumerated() {
+            let keep = obs.indices.filter { !group.contains($0) }.map { obs[$0] }
+            let t = try #require(DirectionalFit.fitRadial(keep, kernel: kernel, diag: diag))
+            let q = obs[group[0]].src
+            let brute: Double = if group.count == 2 {
+                (t.apply(q) - Vec2(obs[group[0]].value, obs[group[1]].value)).length * nd.scale
+            } else {
+                abs(t.apply(q).x * obs[group[0]].dir.x + t.apply(q).y * obs[group[0]].dir.y - obs[group[0]].value) * nd.scale
+            }
+            #expect(abs(fast[g] - brute) < 1e-6 * max(1, brute))
+        }
+    }
+
+    @Test func correctsAcrossTheRoadOnly() throws {
+        // A map whose region x < 1000 m is shifted 40 m east; points only outside it.
+        var rng = SplitMix(seed: 9)
+        func truth(_ s: Vec2) -> Vec2 { Vec2(670_000 + s.x * 2 + (s.x < 500 ? 40 : 0), 6_570_000 + s.y * 2) }
+        var src: [Vec2] = [], dst: [Vec2] = []
+        for _ in 0..<40 {
+            let s = Vec2(rng.uniform(600, 3000), rng.uniform(0, 2000))
+            src.append(s); dst.append(truth(s))
+        }
+        // A north–south road inside the shifted region: it fixes east–west only.
+        let roadSrc = Vec2(250, 1000)
+        let road = LineConstraint(src: roadSrc, point: truth(roadSrc) + Vec2(0, 300), normal: Vec2(1, 0))
+        let p = ModelParameters.local(rangeMetres: 800, noiseRatio: 0.1)
+        let without = try #require(TransformFitter.fit(.localCorrection, src: src, dst: dst, parameters: p, srcUnitsPerMetre: 0.5))
+        let with = try #require(TransformFitter.fit(.localCorrection, src: src, dst: dst, lines: [road], parameters: p, srcUnitsPerMetre: 0.5))
+        let e0 = without.apply(roadSrc) - truth(roadSrc), e1 = with.apply(roadSrc) - truth(roadSrc)
+        #expect(abs(e1.x) < 0.25 * abs(e0.x))      // across the road: corrected
+        #expect(abs(e1.y - e0.y) < 2)              // along the road: unchanged
+    }
+
+    @Test func lineItemsRoundTripAndAreDiagnosed() throws {
+        let (src, dst) = local.patchyPairs(noise: 3, patchOffset: 25, count: 30)
+        var points = zip(src, dst).map { s, d in ControlPoint(image: Vec2(s.x, -s.y), geo: Sweref99TM.unproject(d)) }
+        let s = src[0], d = dst[0]
+        let line = ControlPoint(name: "remnant", image: Vec2(s.x, -s.y), geo: Sweref99TM.unproject(d + Vec2(0, -20)),
+                                lineEnd: Sweref99TM.unproject(d + Vec2(0, 20)))
+        points[0] = line
+        let decoded = try JSONDecoder().decode([ControlPoint].self, from: JSONEncoder().encode(points))
+        #expect(decoded[0].lineEnd != nil && decoded[1].lineEnd == nil)
+        let g = try #require(GeoReference(points: points, kind: .thinPlateSpline))
+        let diag = try #require(g.diagnostics[line.id])
+        #expect(diag.leaveOneOut.isFinite)
+        // Its residual is across the line (east–west here).
+        #expect(abs(diag.residualVector.y) < 1e-6 * max(1, diag.residual))
+    }
+}
