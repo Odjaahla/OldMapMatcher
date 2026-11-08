@@ -104,11 +104,11 @@ import Testing
     /// Random points (metres) mapped by an affine plus patch offsets: every point within a 1 km patch
     /// shares the same displacement, like a map compiled from separately surveyed pieces.
     /// About 5 points per patch, so each patch's offset can be learnt from its neighbours.
-    func patchyPairs(noise: Double, patchOffset: Double, seed: UInt64 = 1) -> ([Vec2], [Vec2]) {
+    func patchyPairs(noise: Double, patchOffset: Double, seed: UInt64 = 1, count: Int = 120) -> ([Vec2], [Vec2]) {
         var rng = SplitMix(seed: seed)
         var patches: [Int: Vec2] = [:]
         var src: [Vec2] = [], dst: [Vec2] = []
-        for _ in 0..<120 {
+        for _ in 0..<count {
             let p = Vec2(rng.uniform(0, 6000), rng.uniform(0, 4000))
             let key = Int(p.x / 1000) * 100 + Int(p.y / 1000)
             let off = patches[key] ?? Vec2(rng.uniform(-patchOffset, patchOffset), rng.uniform(-patchOffset, patchOffset))
@@ -181,6 +181,40 @@ import Testing
 }
 
 /// Small deterministic RNG so the statistical tests are reproducible.
+@Suite struct UncertaintyTests {
+    let local = LocalCorrectionTests()
+
+    func points(_ src: [Vec2], _ dst: [Vec2]) -> [ControlPoint] {
+        zip(src, dst).map { s, d in ControlPoint(image: Vec2(s.x, -s.y), geo: Sweref99TM.unproject(d)) }
+    }
+
+    @Test func matchesErrorsAtHeldOutPlaces() throws {
+        // Fit on half the points; the predicted error at the other half should match the real error there.
+        let (src, dst) = local.patchyPairs(noise: 3, patchOffset: 25, seed: 7, count: 240)
+        let fitIdx = stride(from: 0, to: 240, by: 2).map { $0 }, testIdx = stride(from: 1, to: 240, by: 2).map { $0 }
+        let fitPoints = points(fitIdx.map { src[$0] }, fitIdx.map { dst[$0] })
+        let geo = try #require(GeoReference(points: fitPoints, kind: .localCorrection))
+        let field = try #require(UncertaintyField(points: fitPoints))
+        let actual = testIdx.map { (geo.imageToSweref(Vec2(src[$0].x, -src[$0].y)) - dst[$0]).length }
+        let predicted = testIdx.map { field.rmsError(atSweref: dst[$0]) }
+        let ratio = local.rms(actual) / local.rms(predicted)
+        #expect(ratio > 0.6 && ratio < 1.6, "actual/predicted RMS = \(ratio)")
+    }
+
+    @Test func growsAwayFromThePoints() throws {
+        let (src, dst) = local.patchyPairs(noise: 3, patchOffset: 25)
+        let field = try #require(UncertaintyField(points: points(src, dst)))
+        let inside = field.rmsError(atSweref: dst[0])
+        let outside = field.rmsError(atSweref: Vec2(670_000 - 8000, 6_570_000 - 8000))
+        #expect(outside > 2 * inside)
+    }
+
+    @Test func needsSixPoints() {
+        let (src, dst) = local.patchyPairs(noise: 3, patchOffset: 25, count: 5)
+        #expect(UncertaintyField(points: points(src, dst)) == nil)
+    }
+}
+
 struct SplitMix {
     var state: UInt64
     init(seed: UInt64) { state = seed }

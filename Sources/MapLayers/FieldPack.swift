@@ -2,7 +2,7 @@ import Foundation
 import MapKit
 
 /// The set of georeferenced maps exported by the Mac app for the iPhone app: a folder holding
-/// `maps.json` and one image per map, already warped onto Web Mercator.
+/// `maps.json` and, per map, a tile pack (or, from older exports, one image) warped onto Web Mercator.
 public struct FieldPack: Codable, Equatable, Sendable {
     public static let manifestName = "maps.json"
 
@@ -31,8 +31,14 @@ public struct FieldPack: Codable, Equatable, Sendable {
 
 public struct FieldMap: Codable, Equatable, Identifiable, Sendable {
     public var name: String
-    /// Image file name within the pack folder.
-    public var file: String
+    /// Single warped image within the pack folder (older exports).
+    public var file: String?
+    /// Tile pack within the pack folder, with its zoom range (current exports).
+    public var tiles: String?
+    public var minZoom: Int?
+    public var maxZoom: Int?
+    /// Changes when the map's points, model or image change; lets export and sync skip unchanged maps.
+    public var fingerprint: String?
     /// Edges of the warped image in degrees. The image is a Web Mercator rectangle, so its
     /// corners pin it down exactly.
     public var north: Double, south: Double, west: Double, east: Double
@@ -46,9 +52,11 @@ public struct FieldMap: Codable, Equatable, Identifiable, Sendable {
 
     public var id: String { name }
 
-    public init(name: String, file: String, rect: MKMapRect, points: Int, errorMetres: Double?, model: String,
+    public init(name: String, file: String? = nil, tiles: String? = nil, minZoom: Int? = nil, maxZoom: Int? = nil,
+                fingerprint: String? = nil, rect: MKMapRect, points: Int, errorMetres: Double?, model: String,
                 visible: Bool, opacity: Double) {
-        self.name = name; self.file = file
+        self.name = name; self.file = file; self.tiles = tiles; self.minZoom = minZoom; self.maxZoom = maxZoom
+        self.fingerprint = fingerprint
         let nw = MKMapPoint(x: rect.minX, y: rect.minY).coordinate
         let se = MKMapPoint(x: rect.maxX, y: rect.maxY).coordinate
         north = nw.latitude; west = nw.longitude; south = se.latitude; east = se.longitude

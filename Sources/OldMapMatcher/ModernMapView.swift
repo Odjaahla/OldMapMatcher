@@ -131,6 +131,7 @@ struct ModernMapView: NSViewRepresentable {
         var warped: [LiveWarpOverlay] = []
         var renderers: [ObjectIdentifier: LiveWarpRenderer] = [:]
         var opacities: [ObjectIdentifier: Double] = [:]
+        var uncertainty: UncertaintyOverlay?
         var residualKey: [Double] = []
         var lastFocus: UUID?
         var cancellable: AnyCancellable?
@@ -246,6 +247,8 @@ struct ModernMapView: NSViewRepresentable {
             switch overlay {
             case let t as MKTileOverlay:
                 return MKTileOverlayRenderer(tileOverlay: t)
+            case let u as UncertaintyOverlay:
+                return UncertaintyRenderer(overlay: u)
             case let w as LiveWarpOverlay:
                 let r = LiveWarpRenderer(overlay: w)
                 r.alpha = CGFloat(opacities[ObjectIdentifier(w)] ?? 0.7)
@@ -321,6 +324,7 @@ struct ModernMapView: NSViewRepresentable {
         syncSingle(map, c.predicted, at: state.predictedGeo)
         syncResiduals(map, c)
         syncWarpedOverlays(map, c)
+        syncUncertainty(map, c)
         if let f = state.geoFocus, f.token != c.lastFocus {
             c.lastFocus = f.token
             map.setCenter(f.value.coordinate, animated: true)
@@ -400,6 +404,18 @@ struct ModernMapView: NSViewRepresentable {
         map.addOverlays(lines, level: .aboveLabels)
     }
 
+    /// Above the old maps, below the residual arrows.
+    private func syncUncertainty(_ map: MKMapView, _ c: Coordinator) {
+        let wanted = state.displayedUncertainty
+        guard wanted !== c.uncertainty else { return }
+        if let old = c.uncertainty { map.removeOverlay(old) }
+        c.uncertainty = wanted
+        if let wanted {
+            let base = (c.tileOverlay == nil ? 0 : 1) + c.warped.count
+            map.insertOverlay(wanted, at: base, level: .aboveLabels)
+        }
+    }
+
     private func syncWarpedOverlays(_ map: MKMapView, _ c: Coordinator) {
         let wanted = state.displayedOverlays
         for (o, opacity) in wanted { c.opacities[ObjectIdentifier(o)] = state.peeking ? 0 : opacity }
@@ -414,6 +430,7 @@ struct ModernMapView: NSViewRepresentable {
             let base = c.tileOverlay == nil ? 0 : 1
             for (i, (o, _)) in wanted.enumerated() { map.insertOverlay(o, at: base + i, level: .aboveLabels) }
             c.warped = wanted.map(\.overlay)
+            if let u = c.uncertainty { map.removeOverlay(u); c.uncertainty = nil } // re-added on top by syncUncertainty
         }
         for o in c.warped {
             let id = ObjectIdentifier(o)

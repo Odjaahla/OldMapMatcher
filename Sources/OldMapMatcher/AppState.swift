@@ -79,6 +79,10 @@ final class AppState: ObservableObject {
     @Published var showMarkers = UserDefaults.standard.object(forKey: "showMarkers") as? Bool ?? true {
         didSet { defaults.set(showMarkers, forKey: "showMarkers") }
     }
+    /// Shade the active map's area by how far off the fit is likely to be.
+    @Published var showUncertainty = UserDefaults.standard.bool(forKey: "showUncertainty") {
+        didSet { defaults.set(showUncertainty, forKey: "showUncertainty") }
+    }
     /// Match mode: show the active map's overlay on the modern map.
     @Published var showOverlay = UserDefaults.standard.bool(forKey: "showOverlay") {
         didSet {
@@ -141,6 +145,8 @@ final class AppState: ObservableObject {
     // MARK: Export
 
     @Published private(set) var exporting = false
+    /// What the export is doing right now, shown while it runs.
+    @Published private(set) var exportStatus: String?
     /// Result of the last export, shown as an alert.
     @Published var exportMessage: String?
 
@@ -148,18 +154,29 @@ final class AppState: ObservableObject {
     func exportForPhone() {
         guard !exporting else { return }
         let jobs = documents.compactMap { d in
-            d.geoRef.map { Exporter.Job(imageURL: d.url, name: d.name, geoRef: $0, points: d.enabledPointCount,
+            d.geoRef.map { Exporter.Job(imageURL: d.url, name: d.name, points: d.points, geoRef: $0,
                                         visible: d.visible, opacity: d.opacity) }
         }
         guard !jobs.isEmpty else { exportMessage = "No maps have enough points to export yet."; return }
         exporting = true
+        exportStatus = "Exporting…"
         let folder = Exporter.defaultFolder
         Task {
-            let result = await Task.detached(priority: .userInitiated) { Result { try Exporter.export(jobs, to: folder) } }.value
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    try Exporter.export(jobs, to: folder) { status in
+                        Task { @MainActor in if self.exporting { self.exportStatus = status } }
+                    }
+                }
+            }.value
             exporting = false
+            exportStatus = nil
             switch result {
-            case .success(let n):
-                exportMessage = "Exported \(n) map\(n == 1 ? "" : "s") to iCloud Drive › Old Map Matcher. They appear on the iPhone once iCloud has synced."
+            case .success(let r):
+                let unchanged = r.maps - r.rendered
+                exportMessage = "Exported \(r.maps) map\(r.maps == 1 ? "" : "s") to iCloud Drive › Old Map Matcher "
+                    + "(\(r.rendered) updated\(unchanged > 0 ? ", \(unchanged) unchanged" : ""); \(Int(r.megabytes.rounded())) MB in all). "
+                    + "They appear on the iPhone once iCloud has synced."
             case .failure(let e):
                 exportMessage = "Export failed: \(e.localizedDescription)"
             }
@@ -285,6 +302,8 @@ final class AppState: ObservableObject {
             return documents.reversed().compactMap { d in d.visible ? d.overlay.map { ($0, d.opacity) } : nil }
         }
     }
+
+    var displayedUncertainty: UncertaintyOverlay? { showUncertainty && !peeking ? active?.uncertaintyOverlay : nil }
 
     var overlayBusy: Bool { documents.contains { $0.wantsOverlay && $0.overlayBusy } }
 

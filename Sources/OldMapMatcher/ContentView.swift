@@ -1,3 +1,4 @@
+import MapLayers
 import MapMatchCore
 import SwiftUI
 
@@ -143,6 +144,10 @@ struct ControlBar: View {
             .frame(width: 190)
             Toggle("Residuals", isOn: $state.showResiduals)
                 .help("Arrows from each clicked point to where the model places it")
+            Toggle("Uncertainty", isOn: $state.showUncertainty)
+                .help("Shade the active map by how far off its fit is likely to be. Add points where it's red.")
+                .disabled(state.active?.uncertaintyOverlay == nil)
+            if state.showUncertainty, state.active?.uncertaintyOverlay != nil { UncertaintyLegend() }
             switch state.mode {
             case .match:
                 Toggle("Overlay", isOn: $state.showOverlay)
@@ -162,6 +167,10 @@ struct ControlBar: View {
             }
             if state.overlayBusy { ProgressView().controlSize(.small) }
             Spacer()
+            if let status = state.exportStatus {
+                ProgressView().controlSize(.small)
+                Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
             if state.mode == .explore {
                 Text(state.peeking ? "Showing modern map" : "⌥-drag: correct active map · hold Space: hide layers")
                     .font(.caption)
@@ -171,6 +180,25 @@ struct ControlBar: View {
         .toggleStyle(.checkbox)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
+    }
+}
+
+/// Colour key for the uncertainty shading.
+struct UncertaintyLegend: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(UncertaintyOverlay.bands, id: \.from) { band in
+                let (r, g, b, a) = band.rgba
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color(red: r, green: g, blue: b).opacity(min(1, a * 1.8)))
+                    .frame(width: 12, height: 10)
+                Text("\(Int(band.from))")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text("m+").font(.caption2).foregroundStyle(.secondary)
+        }
+        .help("Likely error of the overlay, in metres: each colour starts at the number after it. Clear below 20 m.")
     }
 }
 

@@ -40,10 +40,15 @@ struct MapScreen: UIViewRepresentable {
 
         c.map = map
         c.locationManager.requestWhenInUseAuthorization()
-        if let r = Coordinator.savedRegion {
-            map.setRegion(r, animated: false)
-        } else if let f = store.footprint {
-            map.setVisibleMapRect(f, edgePadding: UIEdgeInsets(top: 40, left: 20, bottom: 40, right: 20), animated: false)
+        // The map has no size yet; a region set now would be fitted to a zero-sized view (zoomed far out).
+        // Read it now, before the map's first region change saves over it.
+        let saved = Coordinator.savedRegion
+        DispatchQueue.main.async {
+            if let r = saved {
+                map.setRegion(r, animated: false)
+            } else if let f = store.footprint {
+                map.setVisibleMapRect(f, edgePadding: UIEdgeInsets(top: 40, left: 20, bottom: 40, right: 20), animated: false)
+            }
         }
         return container
     }
@@ -55,7 +60,7 @@ struct MapScreen: UIViewRepresentable {
 
         // Old maps, bottom layer first so the top layer is drawn last.
         let wanted = store.maps.reversed().compactMap { m in store.overlays[m.name] }
-        if wanted.map(ObjectIdentifier.init) != c.warped.map(ObjectIdentifier.init) {
+        if wanted.map({ ObjectIdentifier($0) }) != c.warped.map({ ObjectIdentifier($0) }) {
             map.removeOverlays(c.warped)
             c.renderers = [:]
             c.warped = wanted
@@ -67,7 +72,7 @@ struct MapScreen: UIViewRepresentable {
         for (id, r) in c.renderers {
             if let a = c.alphas[id], abs(r.alpha - a) > 0.001 { r.alpha = a }
         }
-        if store.footprint != nil, !c.didFrameMaps, Coordinator.savedRegion == nil, let f = store.footprint {
+        if store.footprint != nil, !c.didFrameMaps, !c.hadSavedRegion, let f = store.footprint {
             c.didFrameMaps = true
             map.setVisibleMapRect(f, edgePadding: UIEdgeInsets(top: 40, left: 20, bottom: 40, right: 20), animated: true)
         }
@@ -76,12 +81,14 @@ struct MapScreen: UIViewRepresentable {
     final class Coordinator: NSObject, MKMapViewDelegate {
         weak var map: MKMapView?
         let locationManager = CLLocationManager()
-        var warped: [WarpedImageOverlay] = []
-        var renderers: [ObjectIdentifier: WarpedImageRenderer] = [:]
+        var warped: [MKOverlay] = []
+        var renderers: [ObjectIdentifier: MKOverlayRenderer] = [:]
         var alphas: [ObjectIdentifier: CGFloat] = [:]
         var appliedBase: BaseMap?
         var tiles: OSMTileOverlay?
         var didFrameMaps = false
+        /// Frame the maps on first launch only, not over a restored view.
+        var hadSavedRegion = Coordinator.savedRegion != nil
 
         static var savedRegion: MKCoordinateRegion? {
             guard let r = UserDefaults.standard.array(forKey: "region") as? [Double], r.count == 4 else { return nil }
@@ -109,6 +116,11 @@ struct MapScreen: UIViewRepresentable {
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             switch overlay {
+            case let t as PackedTileOverlay:
+                let r = MKTileOverlayRenderer(tileOverlay: t)
+                r.alpha = alphas[ObjectIdentifier(t)] ?? 0.8
+                renderers[ObjectIdentifier(t)] = r
+                return r
             case let t as MKTileOverlay:
                 return MKTileOverlayRenderer(tileOverlay: t)
             case let w as WarpedImageOverlay:

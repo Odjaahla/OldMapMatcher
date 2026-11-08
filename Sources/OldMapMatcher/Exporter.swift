@@ -1,10 +1,10 @@
+import CryptoKit
 import Foundation
-import ImageIO
 import MapLayers
 import MapMatchCore
-import UniformTypeIdentifiers
 
-/// Writes every georeferenced map, pre-warped, to a folder in iCloud Drive for the iPhone app.
+/// Writes every georeferenced map, cut into tiles at full resolution, to a folder in iCloud Drive
+/// for the iPhone app. Maps whose points, model and image are unchanged keep their existing tiles.
 enum Exporter {
     static var defaultFolder: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -14,48 +14,73 @@ enum Exporter {
     struct Job: Sendable {
         let imageURL: URL
         let name: String
+        let points: [ControlPoint]
         let geoRef: GeoReference
-        let points: Int
         let visible: Bool
         let opacity: Double
+
+        /// Changes whenever the result would: points, model or the image file itself.
+        var fingerprint: String {
+            var h = SHA256()
+            let enc = JSONEncoder()
+            enc.outputFormatting = .sortedKeys
+            h.update(data: (try? enc.encode(points)) ?? Data())
+            h.update(data: Data(geoRef.kind.rawValue.utf8))
+            let attrs = try? FileManager.default.attributesOfItem(atPath: imageURL.path)
+            h.update(data: Data("\(attrs?[.size] ?? 0)|\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)".utf8))
+            return h.finalize().map { String(format: "%02x", $0) }.joined()
+        }
     }
 
-    /// Returns the number of maps exported.
-    static func export(_ jobs: [Job], to folder: URL) throws -> Int {
+    struct Result: Sendable {
+        let maps: Int
+        let rendered: Int
+        let megabytes: Double
+    }
+
+    static func export(_ jobs: [Job], to folder: URL, progress: @escaping @Sendable (String) -> Void) throws -> Result {
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let manifestURL = folder.appendingPathComponent(FieldPack.manifestName)
+        let previous = (try? Data(contentsOf: manifestURL)).flatMap { try? FieldPack.decode($0) }
         var maps: [FieldMap] = []
-        for job in jobs {
-            guard let (raster, size) = SourceRaster.load(job.imageURL),
-                  let overlay = Warper.warp(raster, imageSize: size, geoRef: job.geoRef)
-            else { continue }
-            let file = job.name + ".heic"
-            try write(overlay.image, to: folder.appendingPathComponent(file))
-            maps.append(FieldMap(name: job.name, file: file, rect: overlay.boundingMapRect, points: job.points,
-                                 errorMetres: job.geoRef.rmsLeaveOneOut, model: job.geoRef.kind.displayName,
-                                 visible: job.visible, opacity: job.opacity))
+        var rendered = 0
+        for (i, job) in jobs.enumerated() {
+            let fp = job.fingerprint
+            let file = job.name + ".tiles"
+            let enabled = job.points.filter(\.enabled).count
+            if let old = previous?.maps.first(where: { $0.name == job.name && $0.fingerprint == fp && $0.tiles == file }),
+               fm.fileExists(atPath: folder.appendingPathComponent(file).path) {
+                var m = old
+                m.visible = job.visible; m.opacity = job.opacity
+                maps.append(m)
+                continue
+            }
+            progress("Loading \(job.name) (\(i + 1) of \(jobs.count))…")
+            guard let source = SourcePyramid.load(job.imageURL) else { continue }
+            let name = job.name
+            guard let made = TileMaker.make(source: source, geoRef: job.geoRef, progress: { share in
+                progress("Cutting \(name) into tiles: \(Int(share * 100))%")
+            }) else { continue }
+            try TilePack.write(made.tiles, to: folder.appendingPathComponent(file))
+            maps.append(FieldMap(name: job.name, tiles: file, minZoom: made.minZoom, maxZoom: made.maxZoom, fingerprint: fp,
+                                 rect: made.bounds, points: enabled, errorMetres: job.geoRef.rmsLeaveOneOut,
+                                 model: job.geoRef.kind.displayName, visible: job.visible, opacity: job.opacity))
+            rendered += 1
         }
-        // Manifest last, so the phone never sees it pointing at images that aren't written yet.
-        try FieldPack(exported: Date(), maps: maps).encoded()
-            .write(to: folder.appendingPathComponent(FieldPack.manifestName), options: .atomic)
+        // Manifest last, so the phone never sees it pointing at files that aren't written yet.
+        try FieldPack(exported: Date(), maps: maps).encoded().write(to: manifestURL, options: .atomic)
 
-        // Remove images of maps that are no longer exported.
-        let keep = Set(maps.map(\.file))
-        for url in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-        where url.pathExtension == "heic" && !keep.contains(url.lastPathComponent) {
-            try? fm.removeItem(at: url)
+        // Remove files of maps that are no longer exported, and single images from older exports.
+        let keep = Set(maps.compactMap(\.tiles))
+        var bytes = 0
+        for url in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey])) ?? [] {
+            if ["heic", "tiles"].contains(url.pathExtension), !keep.contains(url.lastPathComponent) {
+                try? fm.removeItem(at: url)
+            } else {
+                bytes += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            }
         }
-        return maps.count
-    }
-
-    /// HEIC keeps transparency outside the map's footprint at a fraction of PNG's size.
-    private static func write(_ image: CGImage, to url: URL) throws {
-        let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).heic")
-        guard let dest = CGImageDestinationCreateWithURL(tmp as CFURL, UTType.heic.identifier as CFString, 1, nil) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
-        guard CGImageDestinationFinalize(dest) else { throw CocoaError(.fileWriteUnknown) }
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        return Result(maps: maps.count, rendered: rendered, megabytes: Double(bytes) / 1_000_000)
     }
 }

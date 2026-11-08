@@ -29,8 +29,8 @@ final class LayerStore: ObservableObject {
     @Published private(set) var folderName: String?
     @Published private(set) var status: String?
     @Published private(set) var loading = false
-    /// Decoded images of visible maps.
-    @Published private(set) var overlays: [String: WarpedImageOverlay] = [:]
+    /// Overlays of visible maps: tile layers, or decoded images from older exports.
+    @Published private(set) var overlays: [String: MKOverlay] = [:]
 
     @Published var visible: Set<String> = [] { didSet { saveLayerSettings(); loadVisibleImages() } }
     @Published var opacity: [String: Double] = [:] { didSet { saveLayerSettings() } }
@@ -100,7 +100,8 @@ final class LayerStore: ObservableObject {
         }
     }
 
-    /// Returns the new pack, or nil if it's unchanged.
+    /// Returns the new pack, or nil if it's unchanged. Maps whose fingerprint matches the copy
+    /// already in the app are reused, so only changed maps are copied.
     nonisolated private static func copyPack(from folder: URL, to cache: URL, unlessExported current: Date?) throws -> FieldPack? {
         guard folder.startAccessingSecurityScopedResource() else { throw CocoaError(.fileReadNoPermission) }
         defer { folder.stopAccessingSecurityScopedResource() }
@@ -109,11 +110,19 @@ final class LayerStore: ObservableObject {
         if pack.exported == current { return nil }
 
         let fm = FileManager.default
+        let old = (try? Data(contentsOf: cache.appendingPathComponent(FieldPack.manifestName))).flatMap { try? FieldPack.decode($0) }
         let staging = cache.deletingLastPathComponent().appendingPathComponent("Pack-incoming", isDirectory: true)
         try? fm.removeItem(at: staging)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
         for map in pack.maps {
-            try coordinatedRead(folder.appendingPathComponent(map.file)).write(to: staging.appendingPathComponent(map.file))
+            guard let file = map.tiles ?? map.file else { continue }
+            let cached = cache.appendingPathComponent(file)
+            if let fp = map.fingerprint, old?.maps.contains(where: { $0.fingerprint == fp && ($0.tiles ?? $0.file) == file }) == true,
+               fm.fileExists(atPath: cached.path) {
+                try fm.copyItem(at: cached, to: staging.appendingPathComponent(file)) // a clone on APFS: instant
+            } else {
+                try coordinatedCopy(folder.appendingPathComponent(file), to: staging.appendingPathComponent(file))
+            }
         }
         try manifestData.write(to: staging.appendingPathComponent(FieldPack.manifestName))
         try? fm.removeItem(at: cache)
@@ -123,14 +132,24 @@ final class LayerStore: ObservableObject {
 
     /// Reading through a file coordinator makes iCloud Drive download the file first if needed.
     nonisolated private static func coordinatedRead(_ url: URL) throws -> Data {
+        var data = Data()
+        try coordinated(url) { data = try Data(contentsOf: $0) }
+        return data
+    }
+
+    /// Copies without loading the file into memory (tile packs can be hundreds of megabytes).
+    nonisolated private static func coordinatedCopy(_ url: URL, to dest: URL) throws {
+        try coordinated(url) { try FileManager.default.copyItem(at: $0, to: dest) }
+    }
+
+    nonisolated private static func coordinated(_ url: URL, _ body: (URL) throws -> Void) throws {
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
         var coordError: NSError?
-        var result: Result<Data, Error> = .failure(CocoaError(.fileReadUnknown))
+        var inner: Error?
         NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordError) { u in
-            result = Result { try Data(contentsOf: u) }
+            do { try body(u) } catch { inner = error }
         }
-        if let coordError { throw coordError }
-        return try result.get()
+        if let e = coordError ?? inner { throw e }
     }
 
     // MARK: Layers
@@ -160,12 +179,20 @@ final class LayerStore: ObservableObject {
         defaults.set(saved, forKey: "layers")
     }
 
-    /// Decodes images of visible maps and releases hidden ones (each is ~50 MB decoded).
+    /// Opens tile packs of visible maps (cheap: tiles load as they're shown) and releases hidden ones.
+    /// Maps from older exports are single images, decoded in the background (~50 MB each).
     private func loadVisibleImages() {
         for name in overlays.keys where !visible.contains(name) { overlays[name] = nil }
         for m in maps where visible.contains(m.name) && overlays[m.name] == nil && !loadingImages.contains(m.name) {
+            if let tiles = m.tiles {
+                if let reader = TilePack.Reader(url: cacheDir.appendingPathComponent(tiles)) {
+                    overlays[m.name] = PackedTileOverlay(reader: reader, minZoom: m.minZoom ?? 0, maxZoom: m.maxZoom ?? 21, bounds: m.mapRect)
+                }
+                continue
+            }
+            guard let file = m.file else { continue }
             loadingImages.insert(m.name)
-            let url = cacheDir.appendingPathComponent(m.file), rect = m.mapRect, name = m.name
+            let url = cacheDir.appendingPathComponent(file), rect = m.mapRect, name = m.name
             Task {
                 let image = await Task.detached(priority: .userInitiated) { () -> CGImage? in
                     guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }

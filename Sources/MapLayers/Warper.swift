@@ -291,3 +291,91 @@ public final class OSMTileOverlay: MKTileOverlay {
         URLSession.shared.dataTask(with: req) { data, _, error in result(data, error) }.resume()
     }
 }
+
+/// Colours the old map's area by how far off the fit is likely to be (see `UncertaintyField`).
+public final class UncertaintyOverlay: NSObject, MKOverlay, @unchecked Sendable {
+    public let field: UncertaintyField
+    public let geoRef: GeoReference
+    public let imageSize: Vec2
+    public let boundingMapRect: MKMapRect
+    public var coordinate: CLLocationCoordinate2D { MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate }
+
+    public init?(field: UncertaintyField, geoRef: GeoReference, imageSize: Vec2) {
+        guard let rect = Warper.footprint(imageSize: imageSize, geoRef: geoRef) else { return nil }
+        self.field = field
+        self.geoRef = geoRef
+        self.imageSize = imageSize
+        boundingMapRect = rect
+    }
+
+    /// Bands like contour levels, so the levels read clearly: errors from `from` metres up to the next
+    /// band get this colour (r, g, b, alpha). Below the first band the map is left clear.
+    public static let bands: [(from: Double, rgba: (Double, Double, Double, Double))] = [
+        (20, (1.00, 0.86, 0.20, 0.22)),
+        (35, (1.00, 0.55, 0.05, 0.34)),
+        (50, (0.92, 0.15, 0.05, 0.44)),
+        (70, (0.55, 0.00, 0.30, 0.54)),
+    ]
+
+    static func colour(_ metres: Double) -> (Double, Double, Double, Double) {
+        bands.last { metres >= $0.from }?.rgba ?? (0, 0, 0, 0)
+    }
+}
+
+public final class UncertaintyRenderer: MKOverlayRenderer {
+    /// The field changes slowly: it is evaluated on a coarse grid of tile corners and interpolated
+    /// per pixel before the bands are applied, so band edges are smooth and continue across tiles.
+    static let cells = 16
+    static let maxPixels = 256
+
+    override public func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+        guard let o = overlay as? UncertaintyOverlay else { return }
+        let tile = mapRect.intersection(o.boundingMapRect)
+        guard !tile.isEmpty else { return }
+        let r = rect(for: tile)
+        let device = context.convertToDeviceSpace(r)
+        let w = min(Self.maxPixels, max(1, Int(abs(device.width)))), h = min(Self.maxPixels, max(1, Int(abs(device.height))))
+
+        // Error and old-map position at the grid nodes (including the tile's edges).
+        let n = Self.cells, g = n + 1
+        var err = [Double](repeating: 0, count: g * g), ix = err, iy = err
+        for j in 0...n {
+            for i in 0...n {
+                let c = MKMapPoint(x: tile.minX + Double(i) / Double(n) * tile.width,
+                                   y: tile.minY + Double(j) / Double(n) * tile.height).coordinate
+                let ll = LatLon(lat: c.latitude, lon: c.longitude)
+                let ip = o.geoRef.geoToImage(ll)
+                let k = j * g + i
+                err[k] = o.field.rmsError(atSweref: Sweref99TM.project(ll)); ix[k] = ip.x; iy[k] = ip.y
+            }
+        }
+        func lerp(_ a: [Double], _ k: Int, _ tx: Double, _ ty: Double) -> Double {
+            (a[k] * (1 - tx) + a[k + 1] * tx) * (1 - ty) + (a[k + g] * (1 - tx) + a[k + g + 1] * tx) * ty
+        }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            let fy = (Double(y) + 0.5) / Double(h) * Double(n)
+            let j0 = min(n - 1, Int(fy)), ty = fy - Double(j0)
+            for x in 0..<w {
+                let fx = (Double(x) + 0.5) / Double(w) * Double(n)
+                let i0 = min(n - 1, Int(fx)), tx = fx - Double(i0)
+                let k = j0 * g + i0
+                // Only shade the area the old map covers.
+                let sx = lerp(ix, k, tx, ty), sy = lerp(iy, k, tx, ty)
+                guard sx >= 0, sy >= 0, sx <= o.imageSize.x, sy <= o.imageSize.y else { continue }
+                let (cr, cg, cb, a) = UncertaintyOverlay.colour(lerp(err, k, tx, ty))
+                guard a > 0 else { continue }
+                let p = (y * w + x) * 4
+                px[p] = UInt8(cr * a * 255); px[p + 1] = UInt8(cg * a * 255); px[p + 2] = UInt8(cb * a * 255); px[p + 3] = UInt8(a * 255)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(px) as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return }
+        Warper.drawFlipped(image, in: r, context: context)
+    }
+}
+

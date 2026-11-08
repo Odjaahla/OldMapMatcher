@@ -34,6 +34,8 @@ final class MapDocument: ObservableObject, Identifiable {
     @Published private(set) var image: CGImage?
     @Published private(set) var imageSize: Vec2?
     @Published private(set) var overlay: LiveWarpOverlay?
+    /// Shading of how well the points pin the map down; nil with fewer than 6 points.
+    @Published private(set) var uncertaintyOverlay: UncertaintyOverlay?
     @Published private(set) var overlayBusy = false
 
     // Layer settings (persisted by AppState).
@@ -67,6 +69,12 @@ final class MapDocument: ObservableObject, Identifiable {
                 loadError = "Could not read \(gcpURL.lastPathComponent): \(error.localizedDescription). It will not be overwritten until you add a point."
             }
         }
+        // The pixel size from the file header, without decoding the image.
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int {
+            imageSize = Vec2(Double(w), Double(h))
+        }
         refit()
     }
 
@@ -91,15 +99,21 @@ final class MapDocument: ObservableObject, Identifiable {
         fitting = true
         let points = points, kind = kind
         fitTask = Task {
-            let (g, comparison) = await Task.detached(priority: .userInitiated) { () -> (GeoReference?, [TransformKind: Double]) in
+            let size = imageSize
+            let (g, comparison, shading) = await Task.detached(priority: .userInitiated) {
+                () -> (GeoReference?, [TransformKind: Double], UncertaintyOverlay?) in
                 var fits: [TransformKind: GeoReference] = [:]
                 for k in TransformKind.allCases { fits[k] = GeoReference(points: points, kind: k) }
                 let g = fits[kind] ?? (kind != .similarity ? fits[.similarity] : nil)
-                return (g, fits.compactMapValues(\.rmsLeaveOneOut))
+                let shading = g.flatMap { g in
+                    UncertaintyField(points: points).flatMap { f in size.flatMap { UncertaintyOverlay(field: f, geoRef: g, imageSize: $0) } }
+                }
+                return (g, fits.compactMapValues(\.rmsLeaveOneOut), shading)
             }.value
             guard !Task.isCancelled else { return }
             geoRef = g
             modelComparison = comparison
+            uncertaintyOverlay = shading
             fitting = false
             updateOverlay()
         }
