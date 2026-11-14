@@ -384,7 +384,9 @@ struct ModernMapView: NSViewRepresentable {
         map.nudge.target = { [weak state, weak map, weak c] v in
             guard let state, let map, let c, state.mode == .match else { return nil }
             let candidates = state.points.compactMap { p in c.annotations[p.id].map { (p.id, $0.coordinate) } }
-            if let id = state.selection.first, let hit = candidates.first(where: { $0.0 == id }) { return hit }
+            // The selected point, but only while it's in view: moving one you can't see is a mistake.
+            if let id = state.selection.first, let hit = candidates.first(where: { $0.0 == id }),
+               map.nudge.bounds.contains(map.convert(hit.1, toPointTo: map.nudge)) { return hit }
             let near = candidates.min { a, b in
                 let pa = map.convert(a.1, toPointTo: map.nudge), pb = map.convert(b.1, toPointTo: map.nudge)
                 return hypot(pa.x - v.x, pa.y - v.y) < hypot(pb.x - v.x, pb.y - v.y)

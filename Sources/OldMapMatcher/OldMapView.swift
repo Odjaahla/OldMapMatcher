@@ -174,7 +174,9 @@ final class OldMapCanvas: NSView {
         window?.makeFirstResponder(self)
         let v = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.command) {
-            if let m = markers.first(where: \.selected) ?? markerAt(v, within: 80).flatMap({ id in markers.first { $0.id == id } }) {
+            // The selected marker, but only while it's in view: moving one you can't see is a mistake.
+            let selected = markers.first { $0.selected && bounds.contains(viewPoint($0.position)) }
+            if let m = selected ?? markerAt(v, within: 80).flatMap({ id in markers.first { $0.id == id } }) {
                 drag = .nudge(m.id, start: v, from: m.position)
                 onSelect?(m.id)
             }
