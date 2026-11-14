@@ -41,7 +41,12 @@ struct MapScreen: UIViewRepresentable {
 
         c.map = map
         c.locationManager.requestWhenInUseAuthorization()
-        store.mapCenter = { [weak map] in map?.centerCoordinate }
+        // Under the crosshair, which is drawn at the middle of the whole screen. (centerCoordinate is the
+        // middle of the safe area: below the crosshair by half the difference of the top and bottom insets.)
+        store.mapCenter = { [weak map] in
+            guard let map else { return nil }
+            return map.convert(CGPoint(x: map.bounds.midX, y: map.bounds.midY), toCoordinateFrom: map)
+        }
         store.focusMap = { [weak map] coord in
             guard let map else { return }
             let span = min(map.region.span.latitudeDelta, 0.006)
