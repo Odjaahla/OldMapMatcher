@@ -21,6 +21,7 @@ struct CanvasMarker: Equatable {
 /// Pan/zoom viewer for a large scanned map.
 /// - Trackpad scroll pans, pinch zooms; mouse wheel zooms around the cursor.
 /// - Click places a point; drag on empty map pans; drag a marker to move it.
+/// - ⌘-drag anywhere moves the selected marker (or the nearest) by as much as the mouse moves, for fine adjustment.
 final class OldMapCanvas: NSView {
     var onClick: ((Vec2) -> Void)?
     var onHover: ((Vec2?) -> Void)?
@@ -52,7 +53,10 @@ final class OldMapCanvas: NSView {
     private let imageLayer = CALayer()
     private lazy var overlay = MarkerOverlay(canvas: self)
 
-    private enum DragState { case none, panning(last: CGPoint), marker(UUID, start: CGPoint), pending(start: CGPoint) }
+    private enum DragState {
+        case none, panning(last: CGPoint), marker(UUID, start: CGPoint), pending(start: CGPoint)
+        case nudge(UUID, start: CGPoint, from: Vec2)
+    }
     private var drag = DragState.none
     private var draggedMarkerPosition: (UUID, Vec2)?
 
@@ -169,6 +173,13 @@ final class OldMapCanvas: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let v = convert(event.locationInWindow, from: nil)
+        if event.modifierFlags.contains(.command) {
+            if let m = markers.first(where: \.selected) ?? markerAt(v, within: 80).flatMap({ id in markers.first { $0.id == id } }) {
+                drag = .nudge(m.id, start: v, from: m.position)
+                onSelect?(m.id)
+            }
+            return
+        }
         if let hit = markerAt(v) {
             drag = .marker(hit, start: v)
             onSelect?(hit)
@@ -191,6 +202,9 @@ final class OldMapCanvas: NSView {
         case .marker(let id, let start) where hypot(v.x - start.x, v.y - start.y) > 2 || draggedMarkerPosition != nil:
             draggedMarkerPosition = (id, imagePoint(v))
             overlay.needsDisplay = true
+        case .nudge(let id, let start, let from):
+            draggedMarkerPosition = (id, from + (imagePoint(v) - imagePoint(start)))
+            overlay.needsDisplay = true
         default:
             break
         }
@@ -201,7 +215,7 @@ final class OldMapCanvas: NSView {
         switch drag {
         case .pending:
             if event.clickCount <= 1 { onClick?(imagePoint(v)) }
-        case .marker:
+        case .marker, .nudge:
             if let (id, p) = draggedMarkerPosition { onMove?(id, p) }
         default:
             break
@@ -221,11 +235,11 @@ final class OldMapCanvas: NSView {
     override func mouseMoved(with event: NSEvent) { onHover?(imagePoint(convert(event.locationInWindow, from: nil))) }
     override func mouseExited(with event: NSEvent) { onHover?(nil) }
 
-    private func markerAt(_ v: CGPoint) -> UUID? {
+    private func markerAt(_ v: CGPoint, within radius: CGFloat = 10) -> UUID? {
         markers.min { hypot(viewPoint($0.position).x - v.x, viewPoint($0.position).y - v.y) < hypot(viewPoint($1.position).x - v.x, viewPoint($1.position).y - v.y) }
             .flatMap { m in
                 let p = viewPoint(m.position)
-                return hypot(p.x - v.x, p.y - v.y) <= 10 ? m.id : nil
+                return hypot(p.x - v.x, p.y - v.y) <= radius ? m.id : nil
             }
     }
 

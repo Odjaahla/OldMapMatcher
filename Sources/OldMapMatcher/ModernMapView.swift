@@ -41,12 +41,15 @@ final class ResidualLine: MKPolyline {}
 final class HoverMapView: MKMapView {
     var onHover: ((CLLocationCoordinate2D?) -> Void)?
     let correction = CorrectionDragView()
+    let nudge = NudgeDragView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        correction.frame = bounds
-        correction.autoresizingMask = [.width, .height]
-        addSubview(correction)
+        for v in [correction, nudge] as [NSView] {
+            v.frame = bounds
+            v.autoresizingMask = [.width, .height]
+            addSubview(v)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -70,10 +73,52 @@ final class HoverMapView: MKMapView {
 
     override func didAddSubview(_ subview: NSView) {
         super.didAddSubview(subview)
-        // Keep the drag layer above MapKit's own subviews.
-        if subview !== correction, correction.superview === self {
+        // Keep the drag layers above MapKit's own subviews.
+        if subview !== correction, subview !== nudge, correction.superview === self, nudge.superview === self {
             addSubview(correction, positioned: .above, relativeTo: nil)
+            addSubview(nudge, positioned: .above, relativeTo: nil)
         }
+    }
+}
+
+/// Transparent layer over the map that captures ⌘-drags: the selected marker (or the nearest) moves by
+/// as much as the mouse, wherever the drag starts, so it can be placed precisely.
+final class NudgeDragView: NSView {
+    /// The marker to move for a drag starting at a view point: its id and coordinate.
+    var target: ((CGPoint) -> (UUID, CLLocationCoordinate2D)?)?
+    var onChange: ((UUID, CLLocationCoordinate2D) -> Void)?
+    var onEnd: ((UUID, CLLocationCoordinate2D) -> Void)?
+    private var drag: (id: UUID, start: CGPoint, from: CGPoint)?
+    private var last: CLLocationCoordinate2D?
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard NSEvent.modifierFlags.contains(.command), let p = superview?.convert(point, to: self), target?(p) != nil else { return nil }
+        return super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let map = superview as? MKMapView else { return }
+        let v = convert(event.locationInWindow, from: nil)
+        guard let (id, c) = target?(v) else { return }
+        drag = (id, v, map.convert(c, toPointTo: self))
+        last = nil
+        NSCursor.closedHand.push()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let map = superview as? MKMapView, let d = drag else { return }
+        let v = convert(event.locationInWindow, from: nil)
+        let c = map.convert(CGPoint(x: d.from.x + v.x - d.start.x, y: d.from.y + v.y - d.start.y), toCoordinateFrom: self)
+        last = c
+        onChange?(d.id, c)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let d = drag, let c = last { onEnd?(d.id, c) }
+        if drag != nil { NSCursor.pop() }
+        drag = nil; last = nil
     }
 }
 
@@ -142,6 +187,8 @@ struct ModernMapView: NSViewRepresentable {
         var tileOverlay: MKTileOverlay?
         var annotations: [UUID: ControlPointAnnotation] = [:]
         var lineEnds: [UUID: (LineEndAnnotation, LineEndAnnotation)] = [:]
+        /// The marker being ⌘-dragged; its annotation follows the mouse until the drag ends.
+        var nudging: UUID?
         var lineKey: [Double] = []
         let pending = PendingAnnotation()
         let predicted = PredictedAnnotation()
@@ -334,6 +381,32 @@ struct ModernMapView: NSViewRepresentable {
             let to = LatLon(map.convert(e, toCoordinateFrom: map.correction))
             if !state.addCorrection(from: from, to: to) { NSSound.beep() }
         }
+        map.nudge.target = { [weak state, weak map, weak c] v in
+            guard let state, let map, let c, state.mode == .match else { return nil }
+            let candidates = state.points.compactMap { p in c.annotations[p.id].map { (p.id, $0.coordinate) } }
+            if let id = state.selection.first, let hit = candidates.first(where: { $0.0 == id }) { return hit }
+            let near = candidates.min { a, b in
+                let pa = map.convert(a.1, toPointTo: map.nudge), pb = map.convert(b.1, toPointTo: map.nudge)
+                return hypot(pa.x - v.x, pa.y - v.y) < hypot(pb.x - v.x, pb.y - v.y)
+            }
+            guard let near else { return nil }
+            let p = map.convert(near.1, toPointTo: map.nudge)
+            return hypot(p.x - v.x, p.y - v.y) <= 80 ? near : nil
+        }
+        map.nudge.onChange = { [weak state, weak c] id, coord in
+            guard let c else { return }
+            if c.nudging == nil { c.nudging = id; state?.select(id) }
+            c.annotations[id]?.coordinate = coord
+        }
+        map.nudge.onEnd = { [weak state, weak c] id, coord in
+            c?.nudging = nil
+            guard let state else { return }
+            if state.points.first(where: { $0.id == id })?.isLine == true {
+                state.moveLine(of: id, centreTo: LatLon(coord))
+            } else {
+                state.moveGeo(of: id, to: LatLon(coord))
+            }
+        }
         c.mapView = map
         c.installKeyMonitor()
         state.modernMapMetrics = { [weak map] in
@@ -415,7 +488,7 @@ struct ModernMapView: NSViewRepresentable {
                 return a
             }()
             let selected = state.selection.contains(p.id)
-            if a.coordinate.latitude != where_.latitude || a.coordinate.longitude != where_.longitude { a.coordinate = where_ }
+            if c.nudging != p.id, a.coordinate.latitude != where_.latitude || a.coordinate.longitude != where_.longitude { a.coordinate = where_ }
             if a.number != i + 1 || a.selected != selected || a.enabled != p.enabled || a.isLine != p.isLine {
                 a.number = i + 1; a.selected = selected; a.enabled = p.enabled; a.isLine = p.isLine
                 if let v = map.view(for: a) as? MKMarkerAnnotationView { c.configure(v, for: a) }

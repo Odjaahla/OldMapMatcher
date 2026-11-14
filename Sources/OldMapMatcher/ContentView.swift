@@ -427,6 +427,6 @@ struct StatsView: View {
         }
         if state.pendingImage != nil { return "Now click the same feature on the modern map." }
         if state.pendingGeo != nil { return "Now click the same feature on the old map." }
-        return "Click a feature on either map, then the same feature on the other. Drag markers to adjust."
+        return "Click a feature on either map, then the same feature on the other. Drag markers to adjust, or ⌘-drag anywhere to nudge the selected one."
     }
 }
